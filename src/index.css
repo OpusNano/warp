@@ -1,0 +1,84 @@
+@import 'tailwindcss';
+
+:root {
+  --warp-bg: #020202;
+  --warp-surface: #090909;
+  --warp-surface-elevated: #101010;
+  --warp-text: #f7f7f7;
+  --warp-muted: #7d7d7d;
+  --warp-border: rgba(255, 255, 255, 0.12);
+  --warp-green: #9be3b0;
+  --warp-amber: #f1cf81;
+  --warp-red: #ff8f8f;
+  --warp-font-sans: 'Geist', 'IBM Plex Sans', 'Aileron', 'Segoe UI', sans-serif;
+  --warp-font-mono: 'Geist Mono Nerd Font', 'JetBrainsMono Nerd Font', 'SFMono-Regular', monospace;
+}
+
+@theme {
+  --font-sans: var(--warp-font-sans);
+  --font-mono: var(--warp-font-mono);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  min-height: 100%;
+}
+
+body {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.04), transparent 16%),
+    radial-gradient(circle at top, rgba(255, 255, 255, 0.08), transparent 24%),
+    var(--warp-bg);
+  color: var(--warp-text);
+  font-family: var(--warp-font-sans);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+.warp-button {
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--warp-text);
+  padding: 0.65rem 0.9rem;
+  border-radius: 0.5rem;
+  font-family: var(--warp-font-mono);
+  font-size: 0.76rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  transition:
+    background-color 140ms ease,
+    border-color 140ms ease,
+    transform 140ms ease;
+}
+
+.warp-button:hover {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.25);
+}
+
+.warp-button:active {
+  transform: translateY(1px);
+}
+
+.warp-button-primary {
+  background: #f5f5f5;
+  color: #090909;
+  border-color: rgba(255, 255, 255, 0.8);
+}
+
+.warp-button-primary:hover {
+  background: #ffffff;
+}

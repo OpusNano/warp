@@ -1,0 +1,41 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "warp",
+  "version": "0.1.0",
+  "identifier": "io.github.warp-app.warp",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "warp",
+        "width": 1520,
+        "height": 980,
+        "minWidth": 1180,
+        "minHeight": 760,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["appimage"],
+    "createUpdaterArtifacts": false,
+    "icon": ["icons/icon.png"],
+    "linux": {
+      "appimage": {
+        "bundleMediaFramework": false
+      }
+    },
+    "shortDescription": "Fast, minimal split-pane SFTP desktop client",
+    "longDescription": "warp is a Rust-first Tauri desktop client focused on a premium split-pane SFTP workflow, with SCP kept strictly as compatibility mode for transfer-only jobs."
+  }
+}
