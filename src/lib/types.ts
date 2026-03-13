@@ -1,10 +1,11 @@
 export type PaneId = 'local' | 'remote'
 
 export type FileEntry = {
+  path: string
   name: string
   kind: 'dir' | 'file' | 'symlink'
-  size: string
-  modified: string
+  sizeBytes: number | null
+  modifiedUnixMs: number | null
   permissions: string
 }
 
@@ -12,9 +13,8 @@ export type PaneSnapshot = {
   id: PaneId
   title: string
   location: string
-  filter: string
   itemCount: number
-  selectedCount: number
+  canGoUp: boolean
   entries: FileEntry[]
 }
 
@@ -24,8 +24,8 @@ export type TransferJob = {
   direction: 'Upload' | 'Download'
   name: string
   path: string
-  rate: string
-  progress: string
+  rate: string | null
+  progressPercent: number | null
   state: 'Queued' | 'Running' | 'Complete' | 'Failed'
 }
 

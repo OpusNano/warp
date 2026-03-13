@@ -32,4 +32,4 @@ npm run tauri dev
 
 ## Current status
 
-This repository currently contains the initial application shell, visual system, Rust-first module layout, and GitHub Actions setup for Linux-first CI and AppImage releases.
+This repository currently contains the desktop shell, a Rust-backed local filesystem pane with navigation, filtering, inline rename, and in-app delete confirmation, mock-backed remote pane scaffolding, and GitHub Actions setup for Linux-first CI and AppImage releases.
