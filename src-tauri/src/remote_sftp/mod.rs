@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use russh_sftp::{client::SftpSession, protocol::FileType};
 
 use crate::models::{AppBootstrap, FileEntry, PaneSnapshot};
@@ -53,6 +53,21 @@ impl RemoteSftpEngine {
         } else {
             Some(format!("/{}", segments.join("/")))
         }
+    }
+
+    pub fn child_path(parent: &str, name: &str) -> Result<String> {
+        let name = validate_entry_name(name)?;
+        let parent = normalize_remote_path(parent);
+
+        if parent == "/" {
+            Ok(format!("/{name}"))
+        } else {
+            Ok(format!("{}/{}", parent.trim_end_matches('/'), name))
+        }
+    }
+
+    pub fn validate_entry_name(name: &str) -> Result<String> {
+        validate_entry_name(name)
     }
 }
 
@@ -129,6 +144,24 @@ fn normalize_remote_path(path: &str) -> String {
     format!("/{}", trimmed.trim_matches('/'))
 }
 
+fn validate_entry_name(name: &str) -> Result<String> {
+    let trimmed = name.trim();
+
+    if trimmed.is_empty() {
+        bail!("Enter a name before continuing.");
+    }
+
+    if trimmed == "." || trimmed == ".." {
+        bail!("That name is reserved on the remote host.");
+    }
+
+    if trimmed.contains('/') || trimmed.contains('\0') {
+        bail!("Remote names cannot contain path separators.");
+    }
+
+    Ok(trimmed.to_string())
+}
+
 fn format_permissions(metadata: &russh_sftp::client::fs::Metadata) -> String {
     let kind = if metadata.is_dir() {
         'd'
@@ -158,5 +191,19 @@ mod tests {
         assert_eq!(RemoteSftpEngine::parent_path("/"), None);
         assert_eq!(RemoteSftpEngine::parent_path("/srv"), Some("/".into()));
         assert_eq!(RemoteSftpEngine::parent_path("/srv/www/releases"), Some("/srv/www".into()));
+    }
+
+    #[test]
+    fn child_path_joins_root_and_nested_paths() {
+        assert_eq!(RemoteSftpEngine::child_path("/", "logs").unwrap(), "/logs");
+        assert_eq!(RemoteSftpEngine::child_path("/srv/www", "logs").unwrap(), "/srv/www/logs");
+    }
+
+    #[test]
+    fn validate_entry_name_rejects_invalid_names() {
+        assert!(RemoteSftpEngine::validate_entry_name("").is_err());
+        assert!(RemoteSftpEngine::validate_entry_name("../tmp").is_err());
+        assert!(RemoteSftpEngine::validate_entry_name("a/b").is_err());
+        assert!(RemoteSftpEngine::validate_entry_name("..").is_err());
     }
 }

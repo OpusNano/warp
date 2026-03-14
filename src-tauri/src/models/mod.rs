@@ -161,6 +161,47 @@ pub struct QueueUploadRequest {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct CreateRemoteDirectoryRequest {
+    pub parent_path: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenameRemoteEntryRequest {
+    pub parent_path: String,
+    pub entry_name: String,
+    pub new_name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteRemoteEntryRequest {
+    pub parent_path: String,
+    pub entry_name: String,
+    pub entry_kind: String,
+    pub recursive: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteDeletePrompt {
+    pub path: String,
+    pub name: String,
+    pub entry_kind: String,
+    pub message: String,
+    pub requires_recursive: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteDeleteResponse {
+    pub snapshot: RemoteConnectionSnapshot,
+    pub prompt: Option<RemoteDeletePrompt>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TransferConflictResolution {
     pub action: String,
 }
@@ -220,6 +261,8 @@ impl AppBootstrap {
             "Ctrl+1 local".into(),
             "Ctrl+2 remote".into(),
             "Ctrl+F filter".into(),
+            "F2 rename".into(),
+            "Delete remove".into(),
             "F5 refresh".into(),
         ]
     }

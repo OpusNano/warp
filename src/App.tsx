@@ -5,6 +5,8 @@ import {
   cancelTransfer,
   clearCompletedTransfers,
   connectRemote,
+  createRemoteDirectory,
+  deleteRemoteEntry,
   deleteLocalEntry,
   disconnectRemote,
   goUpLocalDirectory,
@@ -16,6 +18,7 @@ import {
   openRemoteDirectory,
   refreshRemoteDirectory,
   renameLocalEntry,
+  renameRemoteEntry,
   resolveRemoteTrust,
   resolveTransferConflict,
 } from './lib/tauri'
@@ -25,6 +28,7 @@ import type {
   FileEntry,
   PaneId,
   PaneSnapshot,
+  RemoteDeletePrompt,
   TransferQueueSnapshot,
   RemoteConnectionSnapshot,
   TransferJob,
@@ -195,9 +199,17 @@ function App() {
   const [connectError, setConnectError] = createSignal<string | null>(null)
   const [remoteRuntimeError, setRemoteRuntimeError] = createSignal<string | null>(null)
   const [trustPrompt, setTrustPrompt] = createSignal<TrustPrompt | null>(null)
+  const [renamingPane, setRenamingPane] = createSignal<PaneId | null>(null)
   const [renamingEntryName, setRenamingEntryName] = createSignal<string | null>(null)
   const [renameDraft, setRenameDraft] = createSignal('')
-  const [pendingDeleteEntry, setPendingDeleteEntry] = createSignal<FileEntry | null>(null)
+  const [creatingDirectoryPane, setCreatingDirectoryPane] = createSignal<PaneId | null>(null)
+  const [createDirectoryDraft, setCreateDirectoryDraft] = createSignal('')
+  const [pendingDeleteTarget, setPendingDeleteTarget] = createSignal<{
+    paneId: PaneId
+    entry: FileEntry
+    recursive: boolean
+    message?: string
+  } | null>(null)
   const [connectHost, setConnectHost] = createSignal('')
   const [connectPort, setConnectPort] = createSignal('22')
   const [connectUsername, setConnectUsername] = createSignal('')
@@ -210,6 +222,7 @@ function App() {
   let remotePaneElement: HTMLElement | undefined
   let localFilterInput: HTMLInputElement | undefined
   let remoteFilterInput: HTMLInputElement | undefined
+  let createDirectoryInput: HTMLInputElement | undefined
   let deleteConfirmButton: HTMLButtonElement | undefined
 
   const localSelectedEntry = createMemo(() => {
@@ -247,6 +260,7 @@ function App() {
     setRemoteLoading(false)
     applyRemoteSnapshot(snapshot, remoteSelection())
     if (snapshot.session.connectionState === 'Disconnected') {
+      clearPaneTransientUi('remote')
       setTrustPrompt(null)
       setRemoteSelection(null)
     }
@@ -303,6 +317,9 @@ function App() {
     setSession(snapshot.session)
     setRemotePane(snapshot.remotePane)
     setTrustPrompt(snapshot.trustPrompt)
+    if (snapshot.session.connectionState === 'Disconnected') {
+      clearPaneTransientUi('remote')
+    }
     const isRuntimeError = snapshot.remotePane.location !== 'Not connected' || snapshot.remotePane.entries.length > 0
     setConnectError(isRuntimeError ? null : snapshot.session.lastError)
     setRemoteRuntimeError(isRuntimeError ? snapshot.session.lastError : null)
@@ -462,9 +479,24 @@ function App() {
     setRemoteSelection(value)
   }
 
-  const cancelInlineRename = () => {
+  const selectedEntryForPane = (paneId: PaneId) => (paneId === 'local' ? localSelectedEntry() : remoteSelectedEntry())
+
+  const cancelInlineRename = (paneId?: PaneId) => {
+    if (paneId !== undefined && renamingPane() !== paneId) return
+    setRenamingPane(null)
     setRenamingEntryName(null)
     setRenameDraft('')
+  }
+
+  const cancelCreateDirectory = (paneId?: PaneId) => {
+    if (paneId !== undefined && creatingDirectoryPane() !== paneId) return
+    setCreatingDirectoryPane(null)
+    setCreateDirectoryDraft('')
+  }
+
+  const closeDeleteConfirmation = (paneId?: PaneId) => {
+    if (paneId !== undefined && pendingDeleteTarget()?.paneId !== paneId) return
+    setPendingDeleteTarget(null)
   }
 
   const syncSelection = (paneId: PaneId, pane: PaneSnapshot, preferredName: string | null) => {
@@ -514,17 +546,17 @@ function App() {
     remoteFilterInput?.select()
   }
 
-  const clearLocalTransientUi = () => {
-    cancelInlineRename()
-    setPendingDeleteEntry(null)
+  const clearPaneTransientUi = (paneId: PaneId) => {
+    cancelInlineRename(paneId)
+    cancelCreateDirectory(paneId)
+    closeDeleteConfirmation(paneId)
   }
 
   const refreshPane = async (paneId: PaneId) => {
     if (paneId === 'local') {
       setLocalLoading(true)
       setLocalError(null)
-      cancelInlineRename()
-      setPendingDeleteEntry(null)
+      clearPaneTransientUi('local')
 
       try {
         const nextPane = await listLocalDirectory(localPane().location)
@@ -541,6 +573,7 @@ function App() {
     setRemoteLoading(true)
     setRemoteRuntimeError(null)
     setConnectError(null)
+    clearPaneTransientUi('remote')
     setSession({ ...session(), connectionState: 'Refreshing', lastError: null })
 
     try {
@@ -564,7 +597,7 @@ function App() {
     if (paneId === 'local') {
       setLocalLoading(true)
       setLocalError(null)
-      clearLocalTransientUi()
+      clearPaneTransientUi('local')
 
       try {
         const nextPane = await openLocalDirectory(localPane().location, entry.name)
@@ -581,6 +614,7 @@ function App() {
     setRemoteLoading(true)
     setRemoteRuntimeError(null)
     setConnectError(null)
+    clearPaneTransientUi('remote')
     setSession({ ...session(), connectionState: 'Opening directory', lastError: null })
 
     try {
@@ -603,7 +637,7 @@ function App() {
 
       setLocalLoading(true)
       setLocalError(null)
-      clearLocalTransientUi()
+      clearPaneTransientUi('local')
 
       try {
         const nextPane = await goUpLocalDirectory(localPane().location)
@@ -622,6 +656,7 @@ function App() {
     setRemoteLoading(true)
     setRemoteRuntimeError(null)
     setConnectError(null)
+    clearPaneTransientUi('remote')
     setSession({ ...session(), connectionState: 'Opening directory', lastError: null })
 
     try {
@@ -656,68 +691,183 @@ function App() {
     await openEntry(paneId, entry)
   }
 
-  const startInlineRename = () => {
-    const entry = localSelectedEntry()
+  const startInlineRename = (paneId: PaneId) => {
+    const entry = selectedEntryForPane(paneId)
     if (!entry) return
 
-    setPendingDeleteEntry(null)
+    closeDeleteConfirmation(paneId)
+    cancelCreateDirectory(paneId)
+    setRenamingPane(paneId)
     setRenamingEntryName(entry.name)
     setRenameDraft(entry.name)
   }
 
-  const commitInlineRename = async () => {
-    const entry = localSelectedEntry()
+  const commitInlineRename = async (paneId: PaneId) => {
+    const entry = selectedEntryForPane(paneId)
     const currentRenamingEntry = renamingEntryName()
     const nextName = renameDraft().trim()
 
-    if (!entry || !currentRenamingEntry || entry.name !== currentRenamingEntry) {
-      cancelInlineRename()
+    if (!entry || !currentRenamingEntry || renamingPane() !== paneId || entry.name !== currentRenamingEntry) {
+      cancelInlineRename(paneId)
       return
     }
 
     if (nextName.length === 0 || nextName === entry.name) {
-      cancelInlineRename()
+      cancelInlineRename(paneId)
       return
     }
 
-    setLocalLoading(true)
-    setLocalError(null)
+    if (paneId === 'local') {
+      setLocalLoading(true)
+      setLocalError(null)
+
+      try {
+        const nextPane = await renameLocalEntry(localPane().location, entry.name, nextName)
+        setPaneSnapshot('local', nextPane, nextName)
+        cancelInlineRename('local')
+      } catch (error) {
+        setLocalError(error instanceof Error ? error.message : 'Failed to rename entry.')
+      } finally {
+        setLocalLoading(false)
+      }
+
+      return
+    }
+
+    setRemoteLoading(true)
+    setRemoteRuntimeError(null)
+    setConnectError(null)
+    setSession({ ...session(), connectionState: 'Renaming remote entry', lastError: null })
 
     try {
-      const nextPane = await renameLocalEntry(localPane().location, entry.name, nextName)
-      setPaneSnapshot('local', nextPane, nextName)
-      cancelInlineRename()
+      const snapshot = await renameRemoteEntry({
+        parentPath: remotePane().location,
+        entryName: entry.name,
+        newName: nextName,
+      })
+      applyRemoteSnapshot(snapshot, nextName)
+      cancelInlineRename('remote')
     } catch (error) {
-      setLocalError(error instanceof Error ? error.message : 'Failed to rename entry.')
+      const message = error instanceof Error ? error.message : 'Failed to rename remote entry.'
+      setRemoteRuntimeError(message)
+      setSession({ ...session(), lastError: null })
     } finally {
-      setLocalLoading(false)
+      setRemoteLoading(false)
     }
   }
 
-  const openDeleteConfirmation = () => {
-    const entry = localSelectedEntry()
+  const startCreateDirectory = (paneId: PaneId) => {
+    closeDeleteConfirmation(paneId)
+    cancelInlineRename(paneId)
+    setCreatingDirectoryPane(paneId)
+    setCreateDirectoryDraft('')
+    queueMicrotask(() => createDirectoryInput?.focus())
+  }
+
+  const commitCreateDirectory = async (paneId: PaneId) => {
+    const nextName = createDirectoryDraft().trim()
+
+    if (creatingDirectoryPane() !== paneId) {
+      cancelCreateDirectory(paneId)
+      return
+    }
+
+    if (nextName.length === 0) {
+      cancelCreateDirectory(paneId)
+      return
+    }
+
+    if (paneId !== 'remote') {
+      cancelCreateDirectory(paneId)
+      return
+    }
+
+    setRemoteLoading(true)
+    setRemoteRuntimeError(null)
+    setConnectError(null)
+    setSession({ ...session(), connectionState: 'Creating remote directory', lastError: null })
+
+    try {
+      const snapshot = await createRemoteDirectory({
+        parentPath: remotePane().location,
+        name: nextName,
+      })
+      applyRemoteSnapshot(snapshot, nextName)
+      cancelCreateDirectory('remote')
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to create remote directory.'
+      setRemoteRuntimeError(message)
+      setSession({ ...session(), lastError: null })
+    } finally {
+      setRemoteLoading(false)
+    }
+  }
+
+  const openDeleteConfirmation = (paneId: PaneId) => {
+    const entry = selectedEntryForPane(paneId)
     if (!entry) return
 
-    cancelInlineRename()
-    setPendingDeleteEntry(entry)
+    cancelInlineRename(paneId)
+    cancelCreateDirectory(paneId)
+    setPendingDeleteTarget({ paneId, entry, recursive: false })
+    queueMicrotask(() => deleteConfirmButton?.focus())
+  }
+
+  const applyRemoteDeletePrompt = (prompt: RemoteDeletePrompt, entry: FileEntry) => {
+    setPendingDeleteTarget({
+      paneId: 'remote',
+      entry,
+      recursive: prompt.requiresRecursive,
+      message: prompt.message,
+    })
     queueMicrotask(() => deleteConfirmButton?.focus())
   }
 
   const confirmDelete = async () => {
-    const entry = pendingDeleteEntry()
-    if (!entry) return
+    const target = pendingDeleteTarget()
+    if (!target) return
 
-    setLocalLoading(true)
-    setLocalError(null)
+    if (target.paneId === 'local') {
+      setLocalLoading(true)
+      setLocalError(null)
+
+      try {
+        const nextPane = await deleteLocalEntry(localPane().location, target.entry.name)
+        setPaneSnapshot('local', nextPane, null)
+        closeDeleteConfirmation('local')
+      } catch (error) {
+        setLocalError(error instanceof Error ? error.message : 'Failed to delete entry.')
+      } finally {
+        setLocalLoading(false)
+      }
+
+      return
+    }
+
+    setRemoteLoading(true)
+    setRemoteRuntimeError(null)
+    setConnectError(null)
 
     try {
-      const nextPane = await deleteLocalEntry(localPane().location, entry.name)
-      setPaneSnapshot('local', nextPane, null)
-      setPendingDeleteEntry(null)
+      const response = await deleteRemoteEntry({
+        parentPath: remotePane().location,
+        entryName: target.entry.name,
+        entryKind: target.entry.kind,
+        recursive: target.recursive,
+      })
+
+      if (response.prompt) {
+        applyRemoteSnapshot(response.snapshot, target.entry.name)
+        applyRemoteDeletePrompt(response.prompt, target.entry)
+      } else {
+        applyRemoteSnapshot(response.snapshot, null)
+        closeDeleteConfirmation('remote')
+      }
     } catch (error) {
-      setLocalError(error instanceof Error ? error.message : 'Failed to delete entry.')
+      const message = error instanceof Error ? error.message : 'Failed to delete remote entry.'
+      setRemoteRuntimeError(message)
     } finally {
-      setLocalLoading(false)
+      setRemoteLoading(false)
     }
   }
 
@@ -806,10 +956,10 @@ function App() {
   const handleShortcut = (event: KeyboardEvent) => {
     if (dragging()) return
 
-    if (pendingDeleteEntry()) {
+    if (pendingDeleteTarget()) {
       if (event.key === 'Escape') {
         event.preventDefault()
-        setPendingDeleteEntry(null)
+        closeDeleteConfirmation()
         return
       }
 
@@ -868,6 +1018,18 @@ function App() {
     if (event.key === 'Enter') {
       event.preventDefault()
       void openSelectedEntry(activePane())
+      return
+    }
+
+    if (event.key === 'F2') {
+      event.preventDefault()
+      startInlineRename(activePane())
+      return
+    }
+
+    if (event.key === 'Delete') {
+      event.preventDefault()
+      openDeleteConfirmation(activePane())
       return
     }
 
@@ -1043,8 +1205,10 @@ function App() {
                   selectedName={localSelection()}
                   loading={localLoading()}
                   errorMessage={localError()}
-                  editingName={renamingEntryName()}
+                  editingName={renamingPane() === 'local' ? renamingEntryName() : null}
                   renameDraft={renameDraft()}
+                  creatingDirectory={creatingDirectoryPane() === 'local'}
+                  createDirectoryDraft={createDirectoryDraft()}
                   selectedCount={selectedCount('local')}
                   setPaneRef={(element) => {
                     localPaneElement = element
@@ -1067,16 +1231,16 @@ function App() {
                     activatePane('local')
                   }}
                   onEntryOpen={(entry) => void openEntry('local', entry)}
-                  onRenameStart={() => startInlineRename()}
+                  onRenameStart={() => startInlineRename('local')}
                   onRenameDraft={setRenameDraft}
-                  onRenameCommit={() => void commitInlineRename()}
-                  onRenameCancel={cancelInlineRename}
+                  onRenameCommit={() => void commitInlineRename('local')}
+                  onRenameCancel={() => cancelInlineRename('local')}
                   onUp={() => void goUpInPane('local')}
                   onRefresh={() => void refreshPane('local')}
                   transferActionLabel="Upload"
                   onTransfer={() => void queueSelectedUpload()}
                   transferDisabled={!uploadCandidate() || localLoading() || remoteLoading()}
-                  onDelete={() => openDeleteConfirmation()}
+                  onDelete={() => openDeleteConfirmation('local')}
                 />
               </div>
 
@@ -1104,14 +1268,27 @@ function App() {
                   selectedName={remoteSelection()}
                   loading={remoteLoading()}
                   errorMessage={remoteRuntimeError()}
-                  editingName={null}
-                  renameDraft=""
+                  editingName={renamingPane() === 'remote' ? renamingEntryName() : null}
+                  renameDraft={renamingPane() === 'remote' ? renameDraft() : ''}
+                  creatingDirectory={creatingDirectoryPane() === 'remote'}
+                  createDirectoryDraft={createDirectoryDraft()}
                   selectedCount={selectedCount('remote')}
                   setPaneRef={(element) => {
                     remotePaneElement = element
                   }}
                   setFilterRef={(element) => {
                     remoteFilterInput = element
+                  }}
+                  setCreateDirectoryInputRef={(element: HTMLInputElement) => {
+                    createDirectoryInput = element
+                  }}
+                  setRenameInputRef={(element, entry) => {
+                    queueMicrotask(() => {
+                      if (renamingPane() !== 'remote' || renamingEntryName() !== entry.name) return
+                      const [start, end] = renameSelectionRange(entry)
+                      element.focus()
+                      element.setSelectionRange(start, end)
+                    })
                   }}
                   onFilter={setRemoteFilter}
                   onFocus={() => activatePane('remote')}
@@ -1120,12 +1297,20 @@ function App() {
                     activatePane('remote')
                   }}
                   onEntryOpen={(entry) => void openEntry('remote', entry)}
+                  onRenameStart={() => startInlineRename('remote')}
+                  onRenameDraft={setRenameDraft}
+                  onRenameCommit={() => void commitInlineRename('remote')}
+                  onRenameCancel={() => cancelInlineRename('remote')}
+                  onCreateDirectoryStart={session().connectionState === 'Connected' ? () => startCreateDirectory('remote') : undefined}
+                  onCreateDirectoryDraft={setCreateDirectoryDraft}
+                  onCreateDirectoryCommit={() => void commitCreateDirectory('remote')}
+                  onCreateDirectoryCancel={() => cancelCreateDirectory('remote')}
                   onUp={() => void goUpInPane('remote')}
                   onRefresh={() => void refreshPane('remote')}
                   transferActionLabel="Download"
                   onTransfer={() => void queueSelectedDownload()}
                   transferDisabled={!downloadCandidate() || remoteLoading() || localLoading()}
-                  onDelete={undefined}
+                  onDelete={() => openDeleteConfirmation('remote')}
                 />
               </div>
             </div>
@@ -1213,20 +1398,25 @@ function App() {
         </main>
       </div>
 
-      <Show when={pendingDeleteEntry()}>
-        {(entry) => (
-          <div class="absolute inset-0 z-30 flex items-center justify-center bg-black/60 px-4" onPointerDown={() => setPendingDeleteEntry(null)}>
+      <Show when={pendingDeleteTarget()}>
+        {(target) => (
+          <div class="absolute inset-0 z-30 flex items-center justify-center bg-black/60 px-4" onPointerDown={() => closeDeleteConfirmation()}>
             <div
               class="w-full max-w-md rounded-xl border border-white/10 bg-[var(--warp-surface-elevated)] p-5 shadow-[0_30px_120px_rgba(0,0,0,0.55)]"
               onPointerDown={(event) => event.stopPropagation()}
             >
               <div class="font-mono text-[11px] uppercase tracking-[0.24em] text-zinc-500">Delete Entry</div>
-              <div class="mt-3 font-mono text-sm text-zinc-300">This will permanently delete:</div>
+              <div class="mt-3 font-mono text-sm text-zinc-300">
+                {target().message ?? 'This will permanently delete:'}
+              </div>
               <div class="mt-3 rounded-md border border-red-400/20 bg-red-400/10 px-3 py-3 font-mono text-sm text-white">
-                {entry().name}
+                {target().entry.name}
+                <div class="mt-1 text-[11px] uppercase tracking-[0.18em] text-red-100/70">
+                  {target().entry.kind === 'dir' ? 'Directory' : 'File'}
+                </div>
               </div>
               <div class="mt-5 flex justify-end gap-2">
-                <button class="warp-button" onClick={() => setPendingDeleteEntry(null)}>
+                <button class="warp-button" onClick={() => closeDeleteConfirmation()}>
                   Cancel
                 </button>
                 <button
@@ -1236,7 +1426,7 @@ function App() {
                   class="warp-button border-red-300/30 bg-red-300/10 text-red-100 hover:border-red-300/50 hover:bg-red-300/18"
                   onClick={() => void confirmDelete()}
                 >
-                  Delete
+                  {target().recursive ? 'Delete All' : 'Delete'}
                 </button>
               </div>
             </div>
@@ -1258,10 +1448,13 @@ type PaneProps = {
   errorMessage: string | null
   editingName: string | null
   renameDraft: string
+  creatingDirectory: boolean
+  createDirectoryDraft: string
   selectedCount: number
   setPaneRef: (element: HTMLElement) => void
   setFilterRef: (element: HTMLInputElement) => void
   setRenameInputRef?: (element: HTMLInputElement, entry: FileEntry) => void
+  setCreateDirectoryInputRef?: (element: HTMLInputElement) => void
   onFilter: (value: string) => void
   onFocus: () => void
   onSelect: (entry: FileEntry) => void
@@ -1270,6 +1463,10 @@ type PaneProps = {
   onRenameDraft?: (value: string) => void
   onRenameCommit?: () => void
   onRenameCancel?: () => void
+  onCreateDirectoryStart?: () => void
+  onCreateDirectoryDraft?: (value: string) => void
+  onCreateDirectoryCommit?: () => void
+  onCreateDirectoryCancel?: () => void
   onUp?: () => void
   onRefresh?: () => void
   transferActionLabel?: string
@@ -1331,6 +1528,11 @@ function Pane(props: PaneProps) {
           <button class="warp-button" disabled={!props.onRefresh || props.loading} onClick={props.onRefresh}>
             Refresh
           </button>
+          <Show when={props.onCreateDirectoryStart}>
+            <button class="warp-button" disabled={props.loading} onClick={props.onCreateDirectoryStart}>
+              New Folder
+            </button>
+          </Show>
           <button class="warp-button" disabled={!props.onTransfer || props.transferDisabled} onClick={props.onTransfer}>
             {props.transferActionLabel ?? 'Transfer'}
           </button>
@@ -1345,6 +1547,32 @@ function Pane(props: PaneProps) {
             Delete
           </button>
         </div>
+
+        <Show when={props.creatingDirectory}>
+          <div class="mt-3 rounded-md border border-white/10 bg-white/[0.03] px-3 py-2">
+            <div class="font-mono text-[10px] uppercase tracking-[0.2em] text-zinc-500">New Folder</div>
+            <input
+              ref={props.setCreateDirectoryInputRef}
+              value={props.createDirectoryDraft}
+              onInput={(event) => props.onCreateDirectoryDraft?.(event.currentTarget.value)}
+              onBlur={() => props.onCreateDirectoryCancel?.()}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') {
+                  event.preventDefault()
+                  void props.onCreateDirectoryCommit?.()
+                  return
+                }
+
+                if (event.key === 'Escape') {
+                  event.preventDefault()
+                  props.onCreateDirectoryCancel?.()
+                }
+              }}
+              placeholder="folder name"
+              class="mt-2 block w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 font-mono text-sm text-white outline-none transition placeholder:text-zinc-600 focus:border-white/35"
+            />
+          </div>
+        </Show>
 
         <label class="mt-3 block">
           <span class="mb-2 block font-mono text-[10px] uppercase tracking-[0.2em] text-zinc-500">Filter current pane</span>

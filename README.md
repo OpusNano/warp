@@ -41,12 +41,13 @@ npm run tauri build -- --bundles appimage
 
 ## Current status
 
-This repository currently contains the desktop shell, a Rust-backed local filesystem pane with navigation, filtering, inline rename, and in-app delete confirmation, plus a real SSH/SFTP browsing and transfer slice with:
+This repository currently contains the desktop shell, a Rust-backed local filesystem pane with navigation, filtering, inline rename, and in-app delete confirmation, plus a real SSH/SFTP browsing, mutation, and transfer slice with:
 
 - explicit host trust verification with a first-seen host prompt and known-host mismatch blocking
 - password or private-key authentication
 - connect, disconnect, and reconnect flows in the existing split-pane shell
 - real remote directory listing, enter-directory, go-up, and refresh in the right pane
+- remote create-directory, inline rename, and confirmed delete for files and directories
 - single-file SFTP upload and download through the existing queue panel
 - Rust-owned transfer queue state with progress, cancel, success, failure, overwrite conflict handling, and clearable completed history
 - a compact transfer log panel with newest jobs first and internal scrolling so the split-pane browser keeps its height
@@ -56,8 +57,16 @@ Still intentionally out of scope in the current slice:
 
 - SCP work beyond future compatibility boundaries
 - saved connections
-- remote rename/delete/create-directory actions
+- broad remote mutation flows beyond create-directory, rename, and delete
 - recursive directory transfers, multi-select transfer batches, and drag-and-drop
+
+## Current remote mutation behavior
+
+- Remote create-directory, rename, and delete all run through Rust over SFTP.
+- Remote rename and file delete follow normal Unix/SFTP server semantics; Warp does not add fake ownership restrictions on top of the server.
+- Deleting a non-empty remote directory prompts for recursive removal in the existing delete confirmation flow.
+- Recursive remote delete is supported only through that confirmation flow and refreshes the visible pane after success or failure.
+- If recursive delete fails partway through, Warp shows a short summary instead of raw protocol noise and refreshes the pane to the server's current state.
 
 ## Current transfer behavior
 

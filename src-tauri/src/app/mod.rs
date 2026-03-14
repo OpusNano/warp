@@ -3,8 +3,9 @@ use tauri::State;
 use crate::{
     local_fs::LocalFilesystem,
     models::{
-        AppBootstrap, ConnectRequest, PaneSet, PaneSnapshot, QueueDownloadRequest,
-        QueueUploadRequest, RemoteConnectionSnapshot, TransferConflictResolution,
+        AppBootstrap, ConnectRequest, CreateRemoteDirectoryRequest, DeleteRemoteEntryRequest,
+        PaneSet, PaneSnapshot, QueueDownloadRequest, QueueUploadRequest, RemoteConnectionSnapshot,
+        RemoteDeleteResponse, RenameRemoteEntryRequest, TransferConflictResolution,
         TransferQueueSnapshot, TrustDecision,
     },
     session::SessionManager,
@@ -149,6 +150,39 @@ pub async fn go_up_remote_directory(
 ) -> Result<RemoteConnectionSnapshot, String> {
     session_manager
         .go_up_remote_directory()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn create_remote_directory(
+    session_manager: State<'_, std::sync::Arc<SessionManager>>,
+    request: CreateRemoteDirectoryRequest,
+) -> Result<RemoteConnectionSnapshot, String> {
+    session_manager
+        .create_remote_directory(request)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn rename_remote_entry(
+    session_manager: State<'_, std::sync::Arc<SessionManager>>,
+    request: RenameRemoteEntryRequest,
+) -> Result<RemoteConnectionSnapshot, String> {
+    session_manager
+        .rename_remote_entry(request)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn delete_remote_entry(
+    session_manager: State<'_, std::sync::Arc<SessionManager>>,
+    request: DeleteRemoteEntryRequest,
+) -> Result<RemoteDeleteResponse, String> {
+    session_manager
+        .delete_remote_entry(request)
         .await
         .map_err(|error| error.to_string())
 }

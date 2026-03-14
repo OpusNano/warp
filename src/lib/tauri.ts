@@ -3,10 +3,14 @@ import { mockBootstrap } from './mock-data'
 import type {
   AppBootstrap,
   ConnectRequest,
+  CreateRemoteDirectoryRequest,
+  DeleteRemoteEntryRequest,
   PaneSnapshot,
   QueueDownloadRequest,
   QueueUploadRequest,
   RemoteConnectionSnapshot,
+  RemoteDeleteResponse,
+  RenameRemoteEntryRequest,
   TransferConflictResolution,
   TransferQueueSnapshot,
   TrustDecision,
@@ -140,6 +144,45 @@ export async function goUpRemoteDirectory(): Promise<RemoteConnectionSnapshot> {
   }
 
   return invoke<RemoteConnectionSnapshot>('go_up_remote_directory')
+}
+
+export async function createRemoteDirectory(request: CreateRemoteDirectoryRequest): Promise<RemoteConnectionSnapshot> {
+  if (!window.__TAURI_INTERNALS__) {
+    return {
+      session: mockBootstrap.session,
+      remotePane: mockBootstrap.panes.remote,
+      trustPrompt: null,
+    }
+  }
+
+  return invoke<RemoteConnectionSnapshot>('create_remote_directory', { request })
+}
+
+export async function renameRemoteEntry(request: RenameRemoteEntryRequest): Promise<RemoteConnectionSnapshot> {
+  if (!window.__TAURI_INTERNALS__) {
+    return {
+      session: mockBootstrap.session,
+      remotePane: mockBootstrap.panes.remote,
+      trustPrompt: null,
+    }
+  }
+
+  return invoke<RemoteConnectionSnapshot>('rename_remote_entry', { request })
+}
+
+export async function deleteRemoteEntry(request: DeleteRemoteEntryRequest): Promise<RemoteDeleteResponse> {
+  if (!window.__TAURI_INTERNALS__) {
+    return {
+      snapshot: {
+        session: mockBootstrap.session,
+        remotePane: mockBootstrap.panes.remote,
+        trustPrompt: null,
+      },
+      prompt: null,
+    }
+  }
+
+  return invoke<RemoteDeleteResponse>('delete_remote_entry', { request })
 }
 
 export async function queueDownload(request: QueueDownloadRequest): Promise<TransferQueueSnapshot> {

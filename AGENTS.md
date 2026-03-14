@@ -31,10 +31,10 @@ Repo-specific guidance for contributors and coding agents working on `warp`.
 - Do not wire buttons or backend functionality unless the task requires it.
 - Prefer focused changes over broad refactors.
 - Do not add new abstractions without a concrete need.
-- The current remote slice covers connection, trust verification, authentication, remote browsing, and single-file SFTP upload/download with a Rust-owned queue.
+- The current remote slice covers connection, trust verification, authentication, remote browsing, basic remote mutation actions (create directory, rename, delete with recursive confirmation when needed), and single-file SFTP upload/download with a Rust-owned queue.
 - The transfer queue is a compact log panel: newest jobs first, inline conflict actions, clearable completed history, and no layout behavior that pushes the split panes upward.
 - Session liveness is explicit: keepalive and disconnect handling should converge on a clear disconnected state rather than leaving a stale "connected" UI.
-- Do not imply SCP, saved connections, recursive directory transfers, or general remote mutation actions work unless a task explicitly implements them.
+- Do not imply SCP, saved connections, recursive directory transfers, broader remote mutation actions, or other advanced filesystem workflows work unless a task explicitly implements them.
 
 ## Validation
 

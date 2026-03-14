@@ -108,6 +108,37 @@ export type QueueUploadRequest = {
   remoteDirectory: string
 }
 
+export type CreateRemoteDirectoryRequest = {
+  parentPath: string
+  name: string
+}
+
+export type RenameRemoteEntryRequest = {
+  parentPath: string
+  entryName: string
+  newName: string
+}
+
+export type DeleteRemoteEntryRequest = {
+  parentPath: string
+  entryName: string
+  entryKind: FileEntry['kind']
+  recursive: boolean
+}
+
+export type RemoteDeletePrompt = {
+  path: string
+  name: string
+  entryKind: FileEntry['kind']
+  message: string
+  requiresRecursive: boolean
+}
+
+export type RemoteDeleteResponse = {
+  snapshot: RemoteConnectionSnapshot
+  prompt: RemoteDeletePrompt | null
+}
+
 export type TransferConflictResolution = {
   action: 'overwrite' | 'cancel'
 }

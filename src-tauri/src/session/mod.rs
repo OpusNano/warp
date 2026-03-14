@@ -12,15 +12,20 @@ use russh::{
     Disconnect, client,
     keys::{Algorithm, HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKey},
 };
-use russh_sftp::client::SftpSession;
+use russh_sftp::{
+    client::{error::Error as SftpError, fs::DirEntry as SftpDirEntry, SftpSession},
+    protocol::{FileType as SftpFileType, StatusCode},
+};
 use tauri::{AppHandle, Emitter};
 use tokio::{sync::Mutex, time};
 
 use crate::{
     events::REMOTE_SESSION_UPDATED_EVENT,
     models::{
-        AppBootstrap, ConnectAuth, ConnectRequest, RemoteConnectionSnapshot, SessionSnapshot,
-        TrustDecision, TrustPrompt,
+        AppBootstrap, ConnectAuth, ConnectRequest, CreateRemoteDirectoryRequest,
+        DeleteRemoteEntryRequest, RemoteConnectionSnapshot, RemoteDeletePrompt,
+        RemoteDeleteResponse, RenameRemoteEntryRequest, SessionSnapshot, TrustDecision,
+        TrustPrompt,
     },
     remote_sftp::RemoteSftpEngine,
     trust::{TrustCheck, TrustModel, fingerprint_sha256},
@@ -52,6 +57,10 @@ struct PendingTrust {
     request: ConnectRequest,
     server_key: PublicKey,
     prompt: TrustPrompt,
+}
+
+struct RecursiveDeleteProgress {
+    deleted_count: usize,
 }
 
 #[derive(Clone)]
@@ -265,6 +274,184 @@ impl SessionManager {
             Err(error) => {
                 apply_remote_operation_error(&mut state, "open the parent remote directory", error);
                 Ok(snapshot_from_state(&state))
+            }
+        }
+    }
+
+    pub async fn create_remote_directory(
+        self: &Arc<Self>,
+        request: CreateRemoteDirectoryRequest,
+    ) -> Result<RemoteConnectionSnapshot> {
+        let mut state = self.state.lock().await;
+        let Some(active) = state.active.as_mut() else {
+            state.last_error = Some("Connect to a host before creating a remote directory.".into());
+            return Ok(snapshot_from_state(&state));
+        };
+
+        let next_name = match RemoteSftpEngine::validate_entry_name(&request.name) {
+            Ok(value) => value,
+            Err(error) => {
+                state.last_error = Some(error.to_string());
+                return Ok(snapshot_from_state(&state));
+            }
+        };
+        let target_path = match RemoteSftpEngine::child_path(&request.parent_path, &next_name) {
+            Ok(value) => value,
+            Err(error) => {
+                state.last_error = Some(error.to_string());
+                return Ok(snapshot_from_state(&state));
+            }
+        };
+
+        match active.sftp.create_dir(&target_path).await {
+            Ok(_) => {
+                refresh_remote_pane_after_mutation(
+                    &mut state,
+                    &request.parent_path,
+                    Some(next_name),
+                    "create the remote directory",
+                )
+                .await;
+                Ok(snapshot_from_state(&state))
+            }
+            Err(error) => {
+                apply_remote_operation_error(
+                    &mut state,
+                    "create the remote directory",
+                    anyhow!(error),
+                );
+                Ok(snapshot_from_state(&state))
+            }
+        }
+    }
+
+    pub async fn rename_remote_entry(
+        self: &Arc<Self>,
+        request: RenameRemoteEntryRequest,
+    ) -> Result<RemoteConnectionSnapshot> {
+        let mut state = self.state.lock().await;
+        let Some(active) = state.active.as_mut() else {
+            state.last_error = Some("Connect to a host before renaming a remote entry.".into());
+            return Ok(snapshot_from_state(&state));
+        };
+
+        let next_name = match RemoteSftpEngine::validate_entry_name(&request.new_name) {
+            Ok(value) => value,
+            Err(error) => {
+                state.last_error = Some(error.to_string());
+                return Ok(snapshot_from_state(&state));
+            }
+        };
+        let source_path = match RemoteSftpEngine::child_path(&request.parent_path, &request.entry_name) {
+            Ok(value) => value,
+            Err(error) => {
+                state.last_error = Some(error.to_string());
+                return Ok(snapshot_from_state(&state));
+            }
+        };
+        let target_path = match RemoteSftpEngine::child_path(&request.parent_path, &next_name) {
+            Ok(value) => value,
+            Err(error) => {
+                state.last_error = Some(error.to_string());
+                return Ok(snapshot_from_state(&state));
+            }
+        };
+
+        match active.sftp.rename(&source_path, &target_path).await {
+            Ok(_) => {
+                refresh_remote_pane_after_mutation(
+                    &mut state,
+                    &request.parent_path,
+                    Some(next_name),
+                    "rename the remote entry",
+                )
+                .await;
+                Ok(snapshot_from_state(&state))
+            }
+            Err(error) => {
+                apply_remote_operation_error(
+                    &mut state,
+                    "rename the remote entry",
+                    anyhow!(error),
+                );
+                Ok(snapshot_from_state(&state))
+            }
+        }
+    }
+
+    pub async fn delete_remote_entry(
+        self: &Arc<Self>,
+        request: DeleteRemoteEntryRequest,
+    ) -> Result<RemoteDeleteResponse> {
+        let mut state = self.state.lock().await;
+        let Some(active) = state.active.as_mut() else {
+            state.last_error = Some("Connect to a host before deleting a remote entry.".into());
+            return Ok(remote_delete_response(&state, None));
+        };
+
+        let target_path = match RemoteSftpEngine::child_path(&request.parent_path, &request.entry_name) {
+            Ok(value) => value,
+            Err(error) => {
+                state.last_error = Some(error.to_string());
+                return Ok(remote_delete_response(&state, None));
+            }
+        };
+
+        if request.entry_kind == "dir" && !request.recursive {
+            match active.sftp.read_dir(&target_path).await {
+                Ok(mut entries) => {
+                    if entries.next().is_some() {
+                        state.last_error = None;
+                        return Ok(remote_delete_response(
+                            &state,
+                            Some(RemoteDeletePrompt {
+                                path: target_path,
+                                name: request.entry_name,
+                                entry_kind: "dir".into(),
+                                message: "This folder is not empty. Delete it and all contents?".into(),
+                                requires_recursive: true,
+                            }),
+                        ));
+                    }
+                }
+                Err(error) => {
+                    apply_remote_operation_error(&mut state, "delete the remote entry", anyhow!(error));
+                    return Ok(remote_delete_response(&state, None));
+                }
+            }
+        }
+
+        let delete_result: std::result::Result<RecursiveDeleteProgress, RemoteFailure> = if request.entry_kind == "dir" && request.recursive {
+            let mut progress = RecursiveDeleteProgress { deleted_count: 0 };
+            delete_remote_directory_recursive(&active.sftp, &target_path, &mut progress)
+                .await
+                .map(|_| progress)
+        } else if request.entry_kind == "dir" {
+            active.sftp
+                .remove_dir(&target_path)
+                .await
+                .map(|_| RecursiveDeleteProgress { deleted_count: 1 })
+                .map_err(classify_remote_failure)
+        } else {
+            active.sftp
+                .remove_file(&target_path)
+                .await
+                .map(|_| RecursiveDeleteProgress { deleted_count: 1 })
+                .map_err(classify_remote_failure)
+        };
+
+        match delete_result {
+            Ok(progress) => {
+                refresh_remote_pane_after_mutation(&mut state, &request.parent_path, None, "delete the remote entry").await;
+                if request.recursive && progress.deleted_count > 1 {
+                    state.last_error = None;
+                }
+                Ok(remote_delete_response(&state, None))
+            }
+            Err(error) => {
+                refresh_remote_pane_after_mutation(&mut state, &request.parent_path, None, "delete the remote entry").await;
+                state.last_error = Some(error.user_message("delete the remote entry"));
+                Ok(remote_delete_response(&state, None))
             }
         }
     }
@@ -709,25 +896,223 @@ fn friendly_auth_error(request: &ConnectRequest, error: &anyhow::Error) -> Strin
     "SSH authentication failed.".into()
 }
 
-fn apply_remote_operation_error(state: &mut SessionState, action: &str, error: anyhow::Error) {
-    let message = error.to_string().to_lowercase();
+fn remote_delete_response(
+    state: &SessionState,
+    prompt: Option<RemoteDeletePrompt>,
+) -> RemoteDeleteResponse {
+    RemoteDeleteResponse {
+        snapshot: snapshot_from_state(state),
+        prompt,
+    }
+}
 
-    if message.contains("disconnect")
-        || message.contains("channel closed")
-        || message.contains("session closed")
-        || message.contains("broken pipe")
-        || message.contains("connection reset")
-        || message.contains("unexpected eof")
+enum RemoteFailure {
+    PermissionDenied,
+    NoSuchFile,
+    AlreadyExists,
+    DirectoryNotEmpty,
+    ConnectionLost,
+    PartialDelete { deleted_count: usize, failed_path: String, reason: Box<RemoteFailure> },
+    Other(String),
+}
+
+impl RemoteFailure {
+    fn user_message(&self, action: &str) -> String {
+        match self {
+            Self::PermissionDenied => format!("Permission denied while trying to {action}."),
+            Self::NoSuchFile => format!("The remote path is no longer available, so Warp could not {action}."),
+            Self::AlreadyExists => {
+                format!("A remote entry with that name already exists, so Warp could not {action}.")
+            }
+            Self::DirectoryNotEmpty => "This folder is not empty.".into(),
+            Self::ConnectionLost => format!("The SSH session ended while trying to {action}. Reconnect and try again."),
+            Self::PartialDelete {
+                deleted_count,
+                failed_path,
+                reason,
+            } => format!(
+                "Stopped deleting folder after removing {deleted_count} entries. {} at `{failed_path}`.",
+                reason.reason_label()
+            ),
+            Self::Other(message) => message.clone(),
+        }
+    }
+
+    fn reason_label(&self) -> &'static str {
+        match self {
+            Self::PermissionDenied => "Permission denied",
+            Self::NoSuchFile => "Path disappeared",
+            Self::AlreadyExists => "Name conflict",
+            Self::DirectoryNotEmpty => "Folder is not empty",
+            Self::ConnectionLost => "Connection lost",
+            Self::PartialDelete { .. } => "Delete failed",
+            Self::Other(_) => "Delete failed",
+        }
+    }
+}
+
+fn classify_remote_failure(error: SftpError) -> RemoteFailure {
+    match error {
+        SftpError::Status(status) => match status.status_code {
+            StatusCode::PermissionDenied => RemoteFailure::PermissionDenied,
+            StatusCode::NoSuchFile => RemoteFailure::NoSuchFile,
+            StatusCode::Failure => {
+                let message = status.error_message.trim();
+                if message.eq_ignore_ascii_case("failure") || message.is_empty() {
+                    RemoteFailure::Other("The server could not complete that remote filesystem operation.".into())
+                } else if message.to_lowercase().contains("not empty") {
+                    RemoteFailure::DirectoryNotEmpty
+                } else {
+                    RemoteFailure::Other(message.into())
+                }
+            }
+            StatusCode::ConnectionLost | StatusCode::NoConnection => RemoteFailure::ConnectionLost,
+            _ => RemoteFailure::Other(format!("{}: {}", status.status_code, status.error_message)),
+        },
+        SftpError::IO(message) => classify_remote_failure_from_text(&message),
+        SftpError::UnexpectedBehavior(message) => classify_remote_failure_from_text(&message),
+        SftpError::UnexpectedPacket => RemoteFailure::Other("The server sent an unexpected SFTP response.".into()),
+        SftpError::Timeout => RemoteFailure::Other("The remote filesystem operation timed out.".into()),
+        SftpError::Limited(message) => RemoteFailure::Other(format!("The server rejected the request: {message}")),
+    }
+}
+
+fn classify_remote_failure_from_text(message: &str) -> RemoteFailure {
+    let lowered = message.to_lowercase();
+
+    if lowered.contains("permission denied") {
+        RemoteFailure::PermissionDenied
+    } else if lowered.contains("no such file") {
+        RemoteFailure::NoSuchFile
+    } else if lowered.contains("already exists") || lowered.contains("file exists") {
+        RemoteFailure::AlreadyExists
+    } else if lowered.contains("directory not empty") || lowered.contains("not empty") {
+        RemoteFailure::DirectoryNotEmpty
+    } else if lowered.contains("channel closed")
+        || lowered.contains("session closed")
+        || lowered.contains("broken pipe")
+        || lowered.contains("connection reset")
+        || lowered.contains("unexpected eof")
+        || lowered.contains("disconnect")
     {
+        RemoteFailure::ConnectionLost
+    } else {
+        RemoteFailure::Other(message.into())
+    }
+}
+
+async fn delete_remote_directory_recursive(
+    sftp: &SftpSession,
+    root_path: &str,
+    progress: &mut RecursiveDeleteProgress,
+) -> std::result::Result<(), RemoteFailure> {
+    let mut stack = vec![(root_path.to_string(), false)];
+
+    while let Some((path, visited)) = stack.pop() {
+        if visited {
+            sftp.remove_dir(&path).await.map_err(|error| RemoteFailure::PartialDelete {
+                    deleted_count: progress.deleted_count,
+                    failed_path: path.clone(),
+                    reason: Box::new(classify_remote_failure(error.clone())),
+            })?;
+            progress.deleted_count += 1;
+            continue;
+        }
+
+        stack.push((path.clone(), true));
+
+        let entries = match sftp.read_dir(&path).await {
+            Ok(entries) => entries.collect::<Vec<SftpDirEntry>>(),
+            Err(error) => {
+                return Err(RemoteFailure::PartialDelete {
+                    deleted_count: progress.deleted_count,
+                    failed_path: path,
+                    reason: Box::new(classify_remote_failure(error)),
+                })
+            }
+        };
+
+        for entry in entries.into_iter().rev() {
+            let child_path = match RemoteSftpEngine::child_path(&path, &entry.file_name()) {
+                Ok(value) => value,
+                Err(error) => {
+                    return Err(RemoteFailure::PartialDelete {
+                        deleted_count: progress.deleted_count,
+                        failed_path: path,
+                        reason: Box::new(RemoteFailure::Other(error.to_string())),
+                    })
+                }
+            };
+
+            match entry.file_type() {
+                SftpFileType::Dir => stack.push((child_path, false)),
+                _ => {
+                    if let Err(error) = sftp.remove_file(&child_path).await {
+                        return Err(RemoteFailure::PartialDelete {
+                            deleted_count: progress.deleted_count,
+                            failed_path: child_path,
+                            reason: Box::new(classify_remote_failure(error)),
+                        });
+                    }
+                    progress.deleted_count += 1;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn refresh_remote_pane_after_mutation(
+    state: &mut SessionState,
+    preferred_path: &str,
+    preferred_name: Option<String>,
+    action: &str,
+) {
+    let Some(active) = state.active.as_mut() else {
+        return;
+    };
+
+    let refresh_attempt = RemoteSftpEngine::list_directory(&active.sftp, Some(preferred_path)).await;
+
+    match refresh_attempt {
+        Ok(next_pane) => {
+            active.remote_pane = next_pane;
+            state.last_error = None;
+        }
+        Err(error) => {
+            let fallback = RemoteSftpEngine::parent_path(preferred_path);
+            if let Some(parent_path) = fallback {
+                match RemoteSftpEngine::list_directory(&active.sftp, Some(&parent_path)).await {
+                    Ok(next_pane) => {
+                        active.remote_pane = next_pane;
+                        state.last_error = preferred_name.map(|name| {
+                            format!(
+                                "Warp completed the change, but the current directory moved. Showing the parent directory instead; look for `{name}` there."
+                            )
+                        });
+                    }
+                    Err(fallback_error) => apply_remote_operation_error(state, action, fallback_error),
+                }
+            } else {
+                apply_remote_operation_error(state, action, error);
+            }
+        }
+    }
+}
+
+fn apply_remote_operation_error(state: &mut SessionState, action: &str, error: anyhow::Error) {
+    let failure = match error.downcast::<SftpError>() {
+        Ok(sftp_error) => classify_remote_failure(sftp_error),
+        Err(other) => classify_remote_failure_from_text(&other.to_string()),
+    };
+
+    if matches!(failure, RemoteFailure::ConnectionLost) {
         state.active = None;
         state.pending_trust = None;
         state.last_error = Some(format!("The SSH session ended while trying to {action}. Reconnect and try again."));
         return;
     }
 
-    state.last_error = Some(match message.as_str() {
-        _ if message.contains("permission denied") => format!("Permission denied while trying to {action}."),
-        _ if message.contains("no such file") => format!("The remote path is no longer available, so Warp could not {action}."),
-        _ => error.to_string(),
-    });
+    state.last_error = Some(failure.user_message(action));
 }
