@@ -47,18 +47,19 @@ This repository currently contains the desktop shell, a Rust-backed local filesy
 - password or private-key authentication
 - connect, disconnect, and reconnect flows in the existing split-pane shell
 - real remote directory listing, enter-directory, go-up, and refresh in the right pane
-- remote create-directory, inline rename, and confirmed delete for files and directories
-- single-file SFTP upload and download through the existing queue panel
-- Rust-owned transfer queue state with progress, cancel, success, failure, overwrite conflict handling, and clearable completed history
+- remote create-directory, inline rename, and confirmed delete for files and directories, including multi-select delete in the existing confirmation flow
+- batch-aware SFTP upload and download through the existing queue panel, including multi-file selection and recursive directory transfers
+- Rust-owned transfer queue state with per-file execution, batch progress, cancel, retry, success, failure, overwrite conflict handling, and clearable completed history
 - a compact transfer log panel with newest jobs first and internal scrolling so the split-pane browser keeps its height
 - SSH keepalive-driven session liveness handling so stale remote sessions fall back to a clear disconnected state
+- real-host validation coverage for transfer, conflict, cancel, retry, and disconnect behavior in `cargo test --manifest-path src-tauri/Cargo.toml`
 
 Still intentionally out of scope in the current slice:
 
 - SCP work beyond future compatibility boundaries
 - saved connections
 - broad remote mutation flows beyond create-directory, rename, and delete
-- recursive directory transfers, multi-select transfer batches, and drag-and-drop
+- drag-and-drop
 
 ## Current remote mutation behavior
 
@@ -70,8 +71,10 @@ Still intentionally out of scope in the current slice:
 
 ## Current transfer behavior
 
-- Transfers are single-file SFTP uploads or downloads only.
+- Transfers run over SFTP and can be queued as single-file, multi-file, mixed-selection, or recursive directory batches.
 - Newer transfer jobs appear at the top of the queue/history panel.
-- Overwrite conflicts are resolved inline from the queue panel.
+- Overwrite conflicts are resolved inline from the queue panel and identify the exact conflicting source and destination item.
+- Queue rows stay batch-oriented even when a single child file is blocked on conflict, cancellation, or retry.
+- Batch progress is aggregated while individual file work stays Rust-owned and internal to the queue engine.
 - Completed transfer history can be cleared without affecting queued or running jobs.
-- If the SSH session drops, the remote side returns to a disconnected state instead of staying silently stale.
+- If the SSH session drops, affected batches pause, the remote side returns to a disconnected state, and the batch can be retried after reconnect.

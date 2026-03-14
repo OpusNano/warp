@@ -16,23 +16,23 @@ use russh_sftp::{
     client::{error::Error as SftpError, fs::DirEntry as SftpDirEntry, SftpSession},
     protocol::{FileType as SftpFileType, StatusCode},
 };
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Runtime};
 use tokio::{sync::Mutex, time};
 
 use crate::{
     events::REMOTE_SESSION_UPDATED_EVENT,
     models::{
         AppBootstrap, ConnectAuth, ConnectRequest, CreateRemoteDirectoryRequest,
-        DeleteRemoteEntryRequest, RemoteConnectionSnapshot, RemoteDeletePrompt,
-        RemoteDeleteResponse, RenameRemoteEntryRequest, SessionSnapshot, TrustDecision,
-        TrustPrompt,
+        DeleteRemoteEntriesRequest, DeleteRemoteEntryRequest, DeleteRemoteEntryTarget,
+        RemoteConnectionSnapshot, RemoteDeletePrompt, RemoteDeleteResponse,
+        RenameRemoteEntryRequest, SessionSnapshot, TrustDecision, TrustPrompt,
     },
     remote_sftp::RemoteSftpEngine,
     trust::{TrustCheck, TrustModel, fingerprint_sha256},
 };
 
-pub struct SessionManager {
-    app_handle: AppHandle,
+pub struct SessionManager<R: Runtime = tauri::Wry> {
+    app_handle: AppHandle<R>,
     trust_model: TrustModel,
     next_session_id: AtomicU64,
     state: Mutex<SessionState>,
@@ -89,8 +89,8 @@ struct SshClientHandler {
     capture: Arc<Mutex<ServerKeyCapture>>,
 }
 
-impl SessionManager {
-    pub fn new(app_handle: AppHandle, base_dir: std::path::PathBuf) -> Self {
+impl<R: Runtime> SessionManager<R> {
+    pub fn new(app_handle: AppHandle<R>, base_dir: std::path::PathBuf) -> Self {
         Self {
             app_handle,
             trust_model: TrustModel::new(base_dir),
@@ -383,77 +383,98 @@ impl SessionManager {
         self: &Arc<Self>,
         request: DeleteRemoteEntryRequest,
     ) -> Result<RemoteDeleteResponse> {
+        self.delete_remote_entries(DeleteRemoteEntriesRequest {
+            parent_path: request.parent_path,
+            entries: vec![DeleteRemoteEntryTarget {
+                entry_name: request.entry_name,
+                entry_kind: request.entry_kind,
+            }],
+            recursive: request.recursive,
+        })
+        .await
+    }
+
+    pub async fn delete_remote_entries(
+        self: &Arc<Self>,
+        request: DeleteRemoteEntriesRequest,
+    ) -> Result<RemoteDeleteResponse> {
         let mut state = self.state.lock().await;
         let Some(active) = state.active.as_mut() else {
             state.last_error = Some("Connect to a host before deleting a remote entry.".into());
             return Ok(remote_delete_response(&state, None));
         };
 
-        let target_path = match RemoteSftpEngine::child_path(&request.parent_path, &request.entry_name) {
-            Ok(value) => value,
-            Err(error) => {
-                state.last_error = Some(error.to_string());
-                return Ok(remote_delete_response(&state, None));
-            }
-        };
+        if request.entries.is_empty() {
+            state.last_error = Some("Select one or more remote entries before deleting them.".into());
+            return Ok(remote_delete_response(&state, None));
+        }
 
-        if request.entry_kind == "dir" && !request.recursive {
-            match active.sftp.read_dir(&target_path).await {
-                Ok(mut entries) => {
-                    if entries.next().is_some() {
-                        state.last_error = None;
-                        return Ok(remote_delete_response(
-                            &state,
-                            Some(RemoteDeletePrompt {
-                                path: target_path,
-                                name: request.entry_name,
-                                entry_kind: "dir".into(),
-                                message: "This folder is not empty. Delete it and all contents?".into(),
-                                requires_recursive: true,
-                            }),
-                        ));
+        let targets = request
+            .entries
+            .iter()
+            .map(|entry| {
+                Ok((
+                    entry,
+                    RemoteSftpEngine::child_path(&request.parent_path, &entry.entry_name)?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        if !request.recursive {
+            for (entry, target_path) in &targets {
+                if entry.entry_kind != "dir" {
+                    continue;
+                }
+
+                match active.sftp.read_dir(target_path).await {
+                    Ok(mut entries) => {
+                        if entries.next().is_some() {
+                            state.last_error = None;
+                            let message = if request.entries.len() == 1 {
+                                "This folder is not empty. Delete it and all contents?".into()
+                            } else {
+                                "One or more selected folders are not empty. Delete all selected entries and their contents?".into()
+                            };
+                            return Ok(remote_delete_response(
+                                &state,
+                                Some(RemoteDeletePrompt {
+                                    message,
+                                    requires_recursive: true,
+                                    entries: request.entries.clone(),
+                                }),
+                            ));
+                        }
+                    }
+                    Err(error) => {
+                        apply_remote_operation_error(&mut state, "delete the remote entry", anyhow!(error));
+                        return Ok(remote_delete_response(&state, None));
                     }
                 }
+            }
+        }
+
+        let mut deleted_entries = 0_usize;
+        let mut first_error = None;
+        for (entry, target_path) in targets {
+            match delete_remote_target(&active.sftp, &target_path, &entry.entry_kind, request.recursive).await {
+                Ok(progress) => {
+                    deleted_entries += progress.deleted_count;
+                }
                 Err(error) => {
-                    apply_remote_operation_error(&mut state, "delete the remote entry", anyhow!(error));
-                    return Ok(remote_delete_response(&state, None));
+                    first_error = Some(error);
+                    break;
                 }
             }
         }
 
-        let delete_result: std::result::Result<RecursiveDeleteProgress, RemoteFailure> = if request.entry_kind == "dir" && request.recursive {
-            let mut progress = RecursiveDeleteProgress { deleted_count: 0 };
-            delete_remote_directory_recursive(&active.sftp, &target_path, &mut progress)
-                .await
-                .map(|_| progress)
-        } else if request.entry_kind == "dir" {
-            active.sftp
-                .remove_dir(&target_path)
-                .await
-                .map(|_| RecursiveDeleteProgress { deleted_count: 1 })
-                .map_err(classify_remote_failure)
-        } else {
-            active.sftp
-                .remove_file(&target_path)
-                .await
-                .map(|_| RecursiveDeleteProgress { deleted_count: 1 })
-                .map_err(classify_remote_failure)
-        };
-
-        match delete_result {
-            Ok(progress) => {
-                refresh_remote_pane_after_mutation(&mut state, &request.parent_path, None, "delete the remote entry").await;
-                if request.recursive && progress.deleted_count > 1 {
-                    state.last_error = None;
-                }
-                Ok(remote_delete_response(&state, None))
-            }
-            Err(error) => {
-                refresh_remote_pane_after_mutation(&mut state, &request.parent_path, None, "delete the remote entry").await;
-                state.last_error = Some(error.user_message("delete the remote entry"));
-                Ok(remote_delete_response(&state, None))
-            }
+        refresh_remote_pane_after_mutation(&mut state, &request.parent_path, None, "delete the remote entry").await;
+        if let Some(error) = first_error {
+            state.last_error = Some(error.user_message("delete the remote entry"));
+        } else if request.recursive && deleted_entries > request.entries.len() {
+            state.last_error = None;
         }
+
+        Ok(remote_delete_response(&state, None))
     }
 
     pub async fn open_transfer_sftp(self: &Arc<Self>) -> Result<SftpSession> {
@@ -998,6 +1019,30 @@ fn classify_remote_failure_from_text(message: &str) -> RemoteFailure {
         RemoteFailure::ConnectionLost
     } else {
         RemoteFailure::Other(message.into())
+    }
+}
+
+async fn delete_remote_target(
+    sftp: &SftpSession,
+    target_path: &str,
+    entry_kind: &str,
+    recursive: bool,
+) -> std::result::Result<RecursiveDeleteProgress, RemoteFailure> {
+    if entry_kind == "dir" && recursive {
+        let mut progress = RecursiveDeleteProgress { deleted_count: 0 };
+        delete_remote_directory_recursive(sftp, target_path, &mut progress)
+            .await
+            .map(|_| progress)
+    } else if entry_kind == "dir" {
+        sftp.remove_dir(target_path)
+            .await
+            .map(|_| RecursiveDeleteProgress { deleted_count: 1 })
+            .map_err(classify_remote_failure)
+    } else {
+        sftp.remove_file(target_path)
+            .await
+            .map(|_| RecursiveDeleteProgress { deleted_count: 1 })
+            .map_err(classify_remote_failure)
     }
 }
 

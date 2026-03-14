@@ -4,7 +4,9 @@ import type {
   AppBootstrap,
   ConnectRequest,
   CreateRemoteDirectoryRequest,
+  DeleteLocalEntriesRequest,
   DeleteRemoteEntryRequest,
+  DeleteRemoteEntriesRequest,
   PaneSnapshot,
   QueueDownloadRequest,
   QueueUploadRequest,
@@ -66,12 +68,12 @@ export async function renameLocalEntry(path: string, entryName: string, newName:
   return invoke<PaneSnapshot>('rename_local_entry', { path, entryName, newName })
 }
 
-export async function deleteLocalEntry(path: string, entryName: string): Promise<PaneSnapshot> {
+export async function deleteLocalEntries(request: DeleteLocalEntriesRequest): Promise<PaneSnapshot> {
   if (!window.__TAURI_INTERNALS__) {
     return mockBootstrap.panes.local
   }
 
-  return invoke<PaneSnapshot>('delete_local_entry', { path, entryName })
+  return invoke<PaneSnapshot>('delete_local_entries', { request })
 }
 
 export async function connectRemote(request: ConnectRequest): Promise<RemoteConnectionSnapshot> {
@@ -185,6 +187,17 @@ export async function deleteRemoteEntry(request: DeleteRemoteEntryRequest): Prom
   return invoke<RemoteDeleteResponse>('delete_remote_entry', { request })
 }
 
+export async function deleteRemoteEntries(request: DeleteRemoteEntriesRequest): Promise<RemoteDeleteResponse> {
+  if (!window.__TAURI_INTERNALS__) {
+    return {
+      snapshot: { session: mockBootstrap.session, remotePane: mockBootstrap.panes.remote, trustPrompt: null },
+      prompt: null,
+    }
+  }
+
+  return invoke<RemoteDeleteResponse>('delete_remote_entries', { request })
+}
+
 export async function queueDownload(request: QueueDownloadRequest): Promise<TransferQueueSnapshot> {
   if (!window.__TAURI_INTERNALS__) {
     return mockBootstrap.transfers
@@ -215,6 +228,14 @@ export async function cancelTransfer(jobId: string): Promise<TransferQueueSnapsh
   }
 
   return invoke<TransferQueueSnapshot>('cancel_transfer', { jobId })
+}
+
+export async function retryTransfer(jobId: string): Promise<TransferQueueSnapshot> {
+  if (!window.__TAURI_INTERNALS__) {
+    return mockBootstrap.transfers
+  }
+
+  return invoke<TransferQueueSnapshot>('retry_transfer', { jobId })
 }
 
 export async function resolveTransferConflict(

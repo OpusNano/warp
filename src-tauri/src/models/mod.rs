@@ -63,6 +63,9 @@ pub struct FileEntry {
 #[serde(rename_all = "camelCase")]
 pub struct TransferJob {
     pub id: String,
+    pub kind: String,
+    pub batch_id: Option<String>,
+    pub parent_id: Option<String>,
     pub protocol: String,
     pub direction: String,
     pub name: String,
@@ -76,6 +79,9 @@ pub struct TransferJob {
     pub error_message: Option<String>,
     pub conflict: Option<TransferConflict>,
     pub can_cancel: bool,
+    pub can_retry: bool,
+    pub summary: Option<TransferJobSummary>,
+    pub current_item_label: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -83,16 +89,35 @@ pub struct TransferJob {
 pub struct TransferConflict {
     pub destination_exists: bool,
     pub destination_kind: String,
+    pub source_kind: String,
+    pub source_name: String,
+    pub source_path: String,
+    pub destination_name: String,
+    pub destination_path: String,
+    pub conflict_kind: String,
     pub can_overwrite: bool,
+    pub apply_to_remaining: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferJobSummary {
+    pub total_files: usize,
+    pub total_directories: usize,
+    pub completed_files: usize,
+    pub failed_files: usize,
+    pub skipped_files: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TransferQueueSnapshot {
+    pub sequence: u64,
     pub jobs: Vec<TransferJob>,
     pub active_job_id: Option<String>,
     pub queued_count: usize,
     pub finished_count: usize,
+    pub batch_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -146,17 +171,23 @@ pub struct TrustDecision {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QueueDownloadRequest {
-    pub remote_path: String,
-    pub remote_name: String,
+    pub entries: Vec<TransferSelectionItem>,
     pub local_directory: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QueueUploadRequest {
-    pub local_path: String,
-    pub local_name: String,
+    pub entries: Vec<TransferSelectionItem>,
     pub remote_directory: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferSelectionItem {
+    pub path: String,
+    pub name: String,
+    pub kind: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -164,6 +195,13 @@ pub struct QueueUploadRequest {
 pub struct CreateRemoteDirectoryRequest {
     pub parent_path: String,
     pub name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteLocalEntriesRequest {
+    pub path: String,
+    pub entry_names: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -183,14 +221,27 @@ pub struct DeleteRemoteEntryRequest {
     pub recursive: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteRemoteEntryTarget {
+    pub entry_name: String,
+    pub entry_kind: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteRemoteEntriesRequest {
+    pub parent_path: String,
+    pub entries: Vec<DeleteRemoteEntryTarget>,
+    pub recursive: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteDeletePrompt {
-    pub path: String,
-    pub name: String,
-    pub entry_kind: String,
     pub message: String,
     pub requires_recursive: bool,
+    pub entries: Vec<DeleteRemoteEntryTarget>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -209,10 +260,12 @@ pub struct TransferConflictResolution {
 impl AppBootstrap {
     pub fn empty_transfers() -> TransferQueueSnapshot {
         TransferQueueSnapshot {
+            sequence: 0,
             jobs: Vec::new(),
             active_job_id: None,
             queued_count: 0,
             finished_count: 0,
+            batch_count: 0,
         }
     }
 

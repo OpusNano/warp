@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    ffi::OsString,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -9,8 +10,11 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use russh_sftp::client::{SftpSession, error::Error as SftpError};
-use tauri::{AppHandle, Emitter};
+use russh_sftp::{
+    client::{SftpSession, error::Error as SftpError, fs::DirEntry as SftpDirEntry},
+    protocol::FileType as SftpFileType,
+};
+use tauri::{AppHandle, Emitter, Runtime};
 use tokio::{
     fs,
     io::{AsyncReadExt, AsyncWriteExt},
@@ -19,46 +23,94 @@ use tokio::{
 
 use crate::{
     events::TRANSFER_QUEUE_UPDATED_EVENT,
-    models::{QueueDownloadRequest, QueueUploadRequest, TransferConflict, TransferConflictResolution, TransferJob, TransferQueueSnapshot},
+    models::{
+        QueueDownloadRequest, QueueUploadRequest, TransferConflict, TransferConflictResolution,
+        TransferJob, TransferJobSummary, TransferQueueSnapshot, TransferSelectionItem,
+    },
+    remote_sftp::RemoteSftpEngine,
     session::SessionManager,
 };
 
 const COPY_BUFFER_SIZE: usize = 64 * 1024;
 
-pub struct TransferManager {
-    app_handle: AppHandle,
-    session_manager: Arc<SessionManager>,
+pub struct TransferManager<R: Runtime = tauri::Wry> {
+    app_handle: AppHandle<R>,
+    session_manager: Arc<SessionManager<R>>,
     next_job_id: AtomicU64,
+    next_snapshot_sequence: AtomicU64,
     state: Mutex<TransferState>,
 }
 
 struct TransferState {
-    jobs: Vec<TransferRecord>,
+    batches: Vec<TransferBatchRecord>,
     active_job_id: Option<String>,
     worker_running: bool,
     cancel_flags: HashMap<String, Arc<AtomicBool>>,
 }
 
-#[derive(Clone)]
-enum TransferTask {
-    Download {
-        remote_path: String,
-        remote_name: String,
-        local_directory: String,
-    },
-    Upload {
-        local_path: String,
-        local_name: String,
-        remote_directory: String,
-    },
+struct TransferBatchRecord {
+    id: String,
+    direction: TransferDirection,
+    destination_root: String,
+    conflict_policy: ConflictPolicy,
+    pause_message: Option<String>,
+    cancel_requested: bool,
+    view: TransferJob,
+    children: Vec<TransferChildRecord>,
+}
+
+struct TransferChildRecord {
+    id: String,
+    batch_id: String,
+    item_kind: PlannedItemKind,
+    task: TransferChildTask,
+    overwrite_approved: bool,
+    view: TransferJob,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TransferDirection {
+    Upload,
+    Download,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConflictPolicy {
+    Ask,
+    OverwriteAll,
+    SkipAll,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PlannedItemKind {
+    File,
+    Directory,
 }
 
 #[derive(Clone)]
-struct TransferRecord {
-    id: String,
-    task: TransferTask,
-    overwrite_approved: bool,
-    view: TransferJob,
+enum TransferChildTask {
+    CreateRemoteDir { remote_path: String },
+    CreateLocalDir { local_path: String },
+    UploadFile { local_path: String, remote_path: String },
+    DownloadFile { remote_path: String, local_path: String },
+}
+
+struct PlannedBatch {
+    direction: TransferDirection,
+    destination_root: String,
+    display_name: String,
+    source_label: String,
+    children: Vec<PlannedChild>,
+    summary: TransferJobSummary,
+}
+
+struct PlannedChild {
+    item_kind: PlannedItemKind,
+    display_name: String,
+    source_path: String,
+    destination_path: String,
+    bytes_total: Option<u64>,
+    task: TransferChildTask,
 }
 
 enum TransferRunOutcome {
@@ -66,16 +118,23 @@ enum TransferRunOutcome {
     Failed(String),
     Cancelled,
     AwaitingConflict(TransferConflict),
+    Skipped,
 }
 
-impl TransferManager {
-    pub fn new(app_handle: AppHandle, session_manager: Arc<SessionManager>) -> Self {
+enum CopyFailure {
+    Cancelled,
+    Failed(String),
+}
+
+impl<R: Runtime> TransferManager<R> {
+    pub fn new(app_handle: AppHandle<R>, session_manager: Arc<SessionManager<R>>) -> Self {
         Self {
             app_handle,
             session_manager,
             next_job_id: AtomicU64::new(1),
+            next_snapshot_sequence: AtomicU64::new(1),
             state: Mutex::new(TransferState {
-                jobs: Vec::new(),
+                batches: Vec::new(),
                 active_job_id: None,
                 worker_running: false,
                 cancel_flags: HashMap::new(),
@@ -85,88 +144,35 @@ impl TransferManager {
 
     pub async fn snapshot(&self) -> TransferQueueSnapshot {
         let state = self.state.lock().await;
-        snapshot_from_state(&state)
+        self.snapshot_from_state(&state)
     }
 
     pub async fn queue_download(self: &Arc<Self>, request: QueueDownloadRequest) -> Result<TransferQueueSnapshot> {
-        if request.remote_path.trim().is_empty() || request.remote_name.trim().is_empty() {
-            bail!("Select a remote file before queuing a download.")
+        if request.entries.is_empty() {
+            bail!("Select one or more remote entries before queuing a download.")
         }
 
         if request.local_directory.trim().is_empty() {
             bail!("Choose a local destination before queuing a download.")
         }
 
-        let destination_path = PathBuf::from(&request.local_directory).join(&request.remote_name);
-        let record = TransferRecord {
-            id: self.next_id(),
-            task: TransferTask::Download {
-                remote_path: request.remote_path.clone(),
-                remote_name: request.remote_name.clone(),
-                local_directory: request.local_directory.clone(),
-            },
-            overwrite_approved: false,
-            view: TransferJob {
-                id: String::new(),
-                protocol: "SFTP".into(),
-                direction: "Download".into(),
-                name: request.remote_name,
-                source_path: request.remote_path,
-                destination_path: destination_path.display().to_string(),
-                rate: None,
-                bytes_total: None,
-                bytes_transferred: 0,
-                progress_percent: None,
-                state: "Queued".into(),
-                error_message: None,
-                conflict: None,
-                can_cancel: true,
-            },
-        }
-        .with_id();
-
-        let snapshot = self.enqueue(record).await;
+        let planned = plan_download_batch(&self.session_manager, request).await?;
+        let snapshot = self.enqueue_batch(planned).await;
         self.spawn_worker_if_needed();
         Ok(snapshot)
     }
 
     pub async fn queue_upload(self: &Arc<Self>, request: QueueUploadRequest) -> Result<TransferQueueSnapshot> {
-        if request.local_path.trim().is_empty() || request.local_name.trim().is_empty() {
-            bail!("Select a local file before queuing an upload.")
+        if request.entries.is_empty() {
+            bail!("Select one or more local entries before queuing an upload.")
         }
 
         if request.remote_directory.trim().is_empty() {
             bail!("Connect to a remote directory before queuing an upload.")
         }
 
-        let record = TransferRecord {
-            id: self.next_id(),
-            task: TransferTask::Upload {
-                local_path: request.local_path.clone(),
-                local_name: request.local_name.clone(),
-                remote_directory: request.remote_directory.clone(),
-            },
-            overwrite_approved: false,
-            view: TransferJob {
-                id: String::new(),
-                protocol: "SFTP".into(),
-                direction: "Upload".into(),
-                name: request.local_name.clone(),
-                source_path: request.local_path,
-                destination_path: join_remote_path(&request.remote_directory, &request.local_name),
-                rate: None,
-                bytes_total: None,
-                bytes_transferred: 0,
-                progress_percent: None,
-                state: "Queued".into(),
-                error_message: None,
-                conflict: None,
-                can_cancel: true,
-            },
-        }
-        .with_id();
-
-        let snapshot = self.enqueue(record).await;
+        let planned = plan_upload_batch(request).await?;
+        let snapshot = self.enqueue_batch(planned).await;
         self.spawn_worker_if_needed();
         Ok(snapshot)
     }
@@ -174,39 +180,36 @@ impl TransferManager {
     pub async fn cancel_transfer(self: &Arc<Self>, job_id: &str) -> TransferQueueSnapshot {
         let snapshot = {
             let mut state = self.state.lock().await;
-            let cancel_flag = state.cancel_flags.get(job_id).cloned();
-            if let Some(job) = state.jobs.iter_mut().find(|job| job.id == job_id) {
-                match job.view.state.as_str() {
-                    "Queued" | "Checking" | "AwaitingConflictDecision" => {
-                        if let Some(flag) = cancel_flag {
-                            flag.store(true, Ordering::Relaxed);
-                        }
-                        job.view.state = "Cancelled".into();
-                        job.view.error_message = None;
-                        job.view.conflict = None;
-                        job.view.can_cancel = false;
-                    }
-                    "Running" | "Cancelling" => {
-                        job.view.state = "Cancelling".into();
-                        job.view.can_cancel = false;
-                        if let Some(flag) = cancel_flag {
-                            flag.store(true, Ordering::Relaxed);
-                        }
-                    }
-                    _ => {}
-                }
+            if cancel_batch_by_id(&mut state, job_id) {
+                self.snapshot_from_state(&state)
+            } else {
+                cancel_child_by_id(&mut state, job_id);
+                self.snapshot_from_state(&state)
             }
-            snapshot_from_state(&state)
         };
         self.emit_snapshot(snapshot.clone());
+        self.spawn_worker_if_needed();
+        snapshot
+    }
+
+    pub async fn retry_transfer(self: &Arc<Self>, job_id: &str) -> TransferQueueSnapshot {
+        let snapshot = {
+            let mut state = self.state.lock().await;
+            if !retry_batch_by_id(&mut state, job_id) {
+                retry_child_by_id(&mut state, job_id);
+            }
+            self.snapshot_from_state(&state)
+        };
+        self.emit_snapshot(snapshot.clone());
+        self.spawn_worker_if_needed();
         snapshot
     }
 
     pub async fn clear_completed(self: &Arc<Self>) -> TransferQueueSnapshot {
         let snapshot = {
             let mut state = self.state.lock().await;
-            state.jobs.retain(|job| !is_terminal_state(&job.view.state));
-            snapshot_from_state(&state)
+            state.batches.retain(|batch| !is_terminal_state(&batch.view.state));
+            self.snapshot_from_state(&state)
         };
         self.emit_snapshot(snapshot.clone());
         snapshot
@@ -220,49 +223,141 @@ impl TransferManager {
         let action = resolution.action.trim().to_lowercase();
         let snapshot = {
             let mut state = self.state.lock().await;
-            let job = state
-                .jobs
-                .iter_mut()
-                .find(|job| job.id == job_id)
+            let (batch_index, child_index) = find_conflict_target_indices(&state, job_id)
                 .ok_or_else(|| anyhow!("Transfer job not found."))?;
+            let batch = &mut state.batches[batch_index];
+            let child = &mut batch.children[child_index];
 
-            if job.view.state != "AwaitingConflictDecision" {
+            if child.view.state != "AwaitingConflictDecision" {
                 bail!("This transfer is not waiting on a conflict decision.")
             }
 
             match action.as_str() {
                 "overwrite" => {
-                    job.overwrite_approved = true;
-                    job.view.state = "Queued".into();
-                    job.view.conflict = None;
-                    job.view.error_message = None;
-                    job.view.can_cancel = true;
+                    child.overwrite_approved = true;
+                    child.view.state = "Queued".into();
+                    child.view.conflict = None;
+                    child.view.error_message = None;
+                    child.view.can_cancel = true;
                 }
-                "cancel" => {
-                    job.overwrite_approved = false;
-                    job.view.state = "Cancelled".into();
-                    job.view.conflict = None;
-                    job.view.error_message = None;
-                    job.view.can_cancel = false;
+                "skip" => {
+                    child.view.state = "Skipped".into();
+                    child.view.conflict = None;
+                    child.view.error_message = None;
+                    child.view.can_cancel = false;
+                }
+                "overwriteall" => {
+                    batch.conflict_policy = ConflictPolicy::OverwriteAll;
+                    child.overwrite_approved = true;
+                    child.view.state = "Queued".into();
+                    child.view.conflict = None;
+                    child.view.error_message = None;
+                    child.view.can_cancel = true;
+                }
+                "skipall" => {
+                    batch.conflict_policy = ConflictPolicy::SkipAll;
+                    child.view.state = "Skipped".into();
+                    child.view.conflict = None;
+                    child.view.error_message = None;
+                    child.view.can_cancel = false;
+                }
+                "cancelbatch" => {
+                    batch.cancel_requested = true;
+                    child.view.state = "Cancelled".into();
+                    child.view.conflict = None;
+                    child.view.error_message = None;
+                    child.view.can_cancel = false;
                 }
                 _ => bail!("Unknown conflict action: {}", resolution.action),
             }
 
-            snapshot_from_state(&state)
+            refresh_batch_aggregate(batch);
+            self.snapshot_from_state(&state)
         };
         self.emit_snapshot(snapshot.clone());
-        if action == "overwrite" {
-            self.spawn_worker_if_needed();
-        }
+        self.spawn_worker_if_needed();
         Ok(snapshot)
     }
 
-    async fn enqueue(&self, mut record: TransferRecord) -> TransferQueueSnapshot {
+    async fn enqueue_batch(&self, planned: PlannedBatch) -> TransferQueueSnapshot {
+        let batch_id = self.next_id();
+        let summary = planned.summary.clone();
+        let view = TransferJob {
+            id: batch_id.clone(),
+            kind: "batch".into(),
+            batch_id: Some(batch_id.clone()),
+            parent_id: None,
+            protocol: "SFTP".into(),
+            direction: planned.direction.label().into(),
+            name: planned.display_name,
+            source_path: planned.source_label,
+            destination_path: planned.destination_root.clone(),
+            rate: None,
+            bytes_total: None,
+            bytes_transferred: 0,
+            progress_percent: Some(0),
+            state: "Queued".into(),
+            error_message: None,
+            conflict: None,
+            can_cancel: true,
+            can_retry: false,
+            summary: Some(summary),
+            current_item_label: None,
+        };
+
+        let children = planned
+            .children
+            .into_iter()
+            .map(|child| {
+                let id = self.next_id();
+                let direction = planned.direction.label().to_string();
+                TransferChildRecord {
+                    id: id.clone(),
+                    batch_id: batch_id.clone(),
+                    item_kind: child.item_kind,
+                    task: child.task,
+                    overwrite_approved: false,
+                    view: TransferJob {
+                        id,
+                        kind: "child".into(),
+                        batch_id: Some(batch_id.clone()),
+                        parent_id: Some(batch_id.clone()),
+                        protocol: "SFTP".into(),
+                        direction,
+                        name: child.display_name,
+                        source_path: child.source_path,
+                        destination_path: child.destination_path,
+                        rate: None,
+                        bytes_total: child.bytes_total,
+                        bytes_transferred: 0,
+                        progress_percent: Some(if child.item_kind == PlannedItemKind::Directory { 0 } else { progress_fraction(0, child.bytes_total) }),
+                        state: "Queued".into(),
+                        error_message: None,
+                        conflict: None,
+                        can_cancel: true,
+                        can_retry: false,
+                        summary: None,
+                        current_item_label: None,
+                    },
+                }
+            })
+            .collect::<Vec<_>>();
+
         let snapshot = {
             let mut state = self.state.lock().await;
-            record.view.id = record.id.clone();
-            state.jobs.push(record);
-            snapshot_from_state(&state)
+            let mut batch = TransferBatchRecord {
+                id: batch_id,
+                direction: planned.direction,
+                destination_root: planned.destination_root,
+                conflict_policy: ConflictPolicy::Ask,
+                pause_message: None,
+                cancel_requested: false,
+                view,
+                children,
+            };
+            refresh_batch_aggregate(&mut batch);
+            state.batches.push(batch);
+            self.snapshot_from_state(&state)
         };
         self.emit_snapshot(snapshot.clone());
         snapshot
@@ -291,44 +386,48 @@ impl TransferManager {
         loop {
             let next_job = {
                 let mut state = self.state.lock().await;
-                let Some(index) = state.jobs.iter().position(|job| job.view.state == "Queued") else {
+                finalize_cancelled_batches(&mut state);
+
+                let Some((batch_index, child_index)) = next_runnable_child(&state) else {
                     state.active_job_id = None;
                     state.worker_running = false;
                     break;
                 };
 
-                let job_id = state.jobs[index].id.clone();
+                let job_id = state.batches[batch_index].children[child_index].id.clone();
                 let cancel_flag = Arc::new(AtomicBool::new(false));
                 state.active_job_id = Some(job_id.clone());
                 state.cancel_flags.insert(job_id.clone(), cancel_flag.clone());
-                state.jobs[index].view.state = "Checking".into();
-                state.jobs[index].view.error_message = None;
-                state.jobs[index].view.conflict = None;
-                state.jobs[index].view.can_cancel = true;
-                let snapshot = snapshot_from_state(&state);
-                let task = state.jobs[index].task.clone();
-                let overwrite_approved = state.jobs[index].overwrite_approved;
-                let id = state.jobs[index].id.clone();
-                (id, task, overwrite_approved, cancel_flag, snapshot)
+                {
+                    let batch = &mut state.batches[batch_index];
+                    batch.pause_message = None;
+                    let child = &mut batch.children[child_index];
+                    child.view.state = "Checking".into();
+                    child.view.error_message = None;
+                    child.view.conflict = None;
+                    child.view.can_cancel = true;
+                    child.view.can_retry = false;
+                    batch.view.current_item_label = Some(child.view.name.clone());
+                    refresh_batch_aggregate(batch);
+                }
+                let snapshot = self.snapshot_from_state(&state);
+
+                (
+                    job_id,
+                    state.batches[batch_index].id.clone(),
+                    state.batches[batch_index].children[child_index].task.clone(),
+                    state.batches[batch_index].children[child_index].overwrite_approved
+                        || state.batches[batch_index].conflict_policy == ConflictPolicy::OverwriteAll,
+                    state.batches[batch_index].conflict_policy == ConflictPolicy::SkipAll,
+                    cancel_flag,
+                    snapshot,
+                )
             };
 
-            self.emit_snapshot(next_job.4);
-
-            let was_cancelled = {
-                let state = self.state.lock().await;
-                state
-                    .jobs
-                    .iter()
-                    .find(|job| job.id == next_job.0)
-                    .is_some_and(|job| job.view.state == "Cancelled")
-            };
-
-            if was_cancelled {
-                continue;
-            }
+            self.emit_snapshot(next_job.6);
 
             let outcome = self
-                .run_transfer(next_job.0.clone(), next_job.1, next_job.2, next_job.3.clone())
+                .run_child_transfer(next_job.0.clone(), next_job.2, next_job.3, next_job.4, next_job.5.clone())
                 .await;
 
             let snapshot = {
@@ -336,43 +435,68 @@ impl TransferManager {
                 state.active_job_id = None;
                 state.cancel_flags.remove(&next_job.0);
                 let mut session_loss_message = None;
-                if let Some(job) = state.jobs.iter_mut().find(|job| job.id == next_job.0) {
-                    match outcome {
-                        TransferRunOutcome::Succeeded => {
-                            job.view.state = "Succeeded".into();
-                            job.view.progress_percent = Some(100);
-                            job.view.rate = None;
-                            job.view.error_message = None;
-                            job.view.conflict = None;
-                            job.view.can_cancel = false;
-                        }
-                        TransferRunOutcome::Cancelled => {
-                            job.view.state = "Cancelled".into();
-                            job.view.rate = None;
-                            job.view.error_message = None;
-                            job.view.conflict = None;
-                            job.view.can_cancel = false;
-                        }
-                        TransferRunOutcome::Failed(message) => {
-                            if is_session_loss_message(&message) {
-                                session_loss_message = Some(message.clone());
+                if let Some(batch) = state.batches.iter_mut().find(|batch| batch.id == next_job.1) {
+                    if let Some(child) = batch.children.iter_mut().find(|child| child.id == next_job.0) {
+                        match outcome {
+                            TransferRunOutcome::Succeeded => {
+                                child.view.state = "Succeeded".into();
+                                child.view.progress_percent = Some(100);
+                                child.view.rate = None;
+                                child.view.error_message = None;
+                                child.view.conflict = None;
+                                child.view.can_cancel = false;
+                                child.view.can_retry = false;
                             }
-                            job.view.state = "Failed".into();
-                            job.view.rate = None;
-                            job.view.error_message = Some(message);
-                            job.view.conflict = None;
-                            job.view.can_cancel = false;
-                        }
-                        TransferRunOutcome::AwaitingConflict(conflict) => {
-                            job.view.state = "AwaitingConflictDecision".into();
-                            job.view.rate = None;
-                            job.view.error_message = None;
-                            job.view.conflict = Some(conflict);
-                            job.view.can_cancel = true;
+                            TransferRunOutcome::Cancelled => {
+                                child.view.state = "Cancelled".into();
+                                child.view.rate = None;
+                                child.view.error_message = None;
+                                child.view.conflict = None;
+                                child.view.can_cancel = false;
+                                child.view.can_retry = true;
+                            }
+                            TransferRunOutcome::Skipped => {
+                                child.view.state = "Skipped".into();
+                                child.view.rate = None;
+                                child.view.error_message = None;
+                                child.view.conflict = None;
+                                child.view.can_cancel = false;
+                                child.view.can_retry = true;
+                            }
+                            TransferRunOutcome::Failed(message) => {
+                                if is_session_loss_message(&message) {
+                                    session_loss_message = Some(message.clone());
+                                    batch.pause_message = Some(message.clone());
+                                }
+                                child.view.state = "Failed".into();
+                                child.view.rate = None;
+                                child.view.error_message = Some(message);
+                                child.view.conflict = None;
+                                child.view.can_cancel = false;
+                                child.view.can_retry = true;
+                            }
+                            TransferRunOutcome::AwaitingConflict(conflict) => {
+                                child.view.state = "AwaitingConflictDecision".into();
+                                child.view.rate = None;
+                                child.view.error_message = None;
+                                child.view.conflict = Some(conflict);
+                                child.view.can_cancel = true;
+                                child.view.can_retry = false;
+                            }
                         }
                     }
+
+                    if batch.cancel_requested {
+                        mark_remaining_children_cancelled(batch);
+                    }
+                    refresh_batch_aggregate(batch);
                 }
-                (snapshot_from_state(&state), session_loss_message)
+
+                if let Some(message) = session_loss_message.as_ref() {
+                    pause_batches_for_disconnect(&mut state, message);
+                }
+
+                (self.snapshot_from_state(&state), session_loss_message)
             };
 
             self.emit_snapshot(snapshot.0);
@@ -382,45 +506,42 @@ impl TransferManager {
         }
     }
 
-    async fn run_transfer(
+    async fn run_child_transfer(
         &self,
         job_id: String,
-        task: TransferTask,
+        task: TransferChildTask,
         overwrite_approved: bool,
+        skip_conflicts: bool,
         cancel_flag: Arc<AtomicBool>,
     ) -> TransferRunOutcome {
         match task {
-            TransferTask::Download {
+            TransferChildTask::CreateRemoteDir { remote_path } => {
+                match self.run_create_remote_dir(&job_id, &remote_path, cancel_flag).await {
+                    Ok(outcome) => outcome,
+                    Err(error) => TransferRunOutcome::Failed(error.to_string()),
+                }
+            }
+            TransferChildTask::CreateLocalDir { local_path } => {
+                match self.run_create_local_dir(&job_id, &local_path, cancel_flag).await {
+                    Ok(outcome) => outcome,
+                    Err(error) => TransferRunOutcome::Failed(error.to_string()),
+                }
+            }
+            TransferChildTask::UploadFile {
+                local_path,
                 remote_path,
-                remote_name,
-                local_directory,
             } => match self
-                .run_download(
-                    &job_id,
-                    &remote_path,
-                    &remote_name,
-                    &local_directory,
-                    overwrite_approved,
-                    cancel_flag,
-                )
+                .run_upload_file(&job_id, &local_path, &remote_path, overwrite_approved, skip_conflicts, cancel_flag)
                 .await
             {
                 Ok(outcome) => outcome,
                 Err(error) => TransferRunOutcome::Failed(error.to_string()),
             },
-            TransferTask::Upload {
+            TransferChildTask::DownloadFile {
+                remote_path,
                 local_path,
-                local_name,
-                remote_directory,
             } => match self
-                .run_upload(
-                    &job_id,
-                    &local_path,
-                    &local_name,
-                    &remote_directory,
-                    overwrite_approved,
-                    cancel_flag,
-                )
+                .run_download_file(&job_id, &remote_path, &local_path, overwrite_approved, skip_conflicts, cancel_flag)
                 .await
             {
                 Ok(outcome) => outcome,
@@ -429,42 +550,135 @@ impl TransferManager {
         }
     }
 
-    async fn run_download(
+    async fn run_create_remote_dir(
         &self,
         job_id: &str,
         remote_path: &str,
-        remote_name: &str,
-        local_directory: &str,
+        cancel_flag: Arc<AtomicBool>,
+    ) -> Result<TransferRunOutcome> {
+        if cancel_flag.load(Ordering::Relaxed) {
+            return Ok(TransferRunOutcome::Cancelled);
+        }
+
+        self.mark_running(job_id, Some(0)).await;
+        let sftp = self.session_manager.open_transfer_sftp().await?;
+        match inspect_remote_conflict(&sftp, remote_path).await {
+            Ok(Some(conflict)) if conflict.destination_kind == "dir" => {
+                let _ = sftp.close().await;
+                Ok(TransferRunOutcome::Succeeded)
+            }
+            Ok(Some(_)) => {
+                let _ = sftp.close().await;
+                Ok(TransferRunOutcome::Failed(
+                    "Warp cannot replace a file destination with a directory.".into(),
+                ))
+            }
+            Ok(None) => {
+                let parent = parent_remote_path(remote_path);
+                ensure_remote_directory_chain(&sftp, &parent).await?;
+                sftp.create_dir(remote_path)
+                    .await
+                    .map_err(|error| anyhow!(classify_transfer_remote_error("create_dir", remote_path, error)))?;
+                let _ = sftp.close().await;
+                self.update_progress(job_id, 0, Some(0), 0).await;
+                Ok(TransferRunOutcome::Succeeded)
+            }
+            Err(error) => {
+                let _ = sftp.close().await;
+                Ok(TransferRunOutcome::Failed(error.to_string()))
+            }
+        }
+    }
+
+    async fn run_create_local_dir(
+        &self,
+        job_id: &str,
+        local_path: &str,
+        cancel_flag: Arc<AtomicBool>,
+    ) -> Result<TransferRunOutcome> {
+        if cancel_flag.load(Ordering::Relaxed) {
+            return Ok(TransferRunOutcome::Cancelled);
+        }
+
+        self.mark_running(job_id, Some(0)).await;
+        let path = PathBuf::from(local_path);
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_dir() {
+                    self.update_progress(job_id, 0, Some(0), 0).await;
+                    return Ok(TransferRunOutcome::Succeeded);
+                }
+
+                return Ok(TransferRunOutcome::Failed(
+                    "Warp cannot replace a file destination with a directory.".into(),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(anyhow!("Unable to inspect local destination {}: {}", path.display(), error)),
+        }
+
+        fs::create_dir_all(&path)
+            .await
+            .with_context(|| format!("failed to create directory {}", path.display()))?;
+        self.update_progress(job_id, 0, Some(0), 0).await;
+        Ok(TransferRunOutcome::Succeeded)
+    }
+
+    async fn run_download_file(
+        &self,
+        job_id: &str,
+        remote_path: &str,
+        local_path: &str,
         overwrite_approved: bool,
+        skip_conflicts: bool,
         cancel_flag: Arc<AtomicBool>,
     ) -> Result<TransferRunOutcome> {
         let sftp = self.session_manager.open_transfer_sftp().await?;
         let metadata = sftp
             .metadata(remote_path)
             .await
-            .map_err(|error| anyhow!(friendly_remote_transfer_error("inspect the remote file", error)))?;
+            .map_err(|error| anyhow!(classify_transfer_remote_error("inspect_file", remote_path, error)))?;
 
         if metadata.is_dir() {
+            let _ = sftp.close().await;
             return Ok(TransferRunOutcome::Failed(
-                "Warp can only download files in this milestone.".into(),
+                "Warp does not recurse through symlinked directories during download.".into(),
             ));
         }
 
-        let destination_path = PathBuf::from(local_directory).join(remote_name);
-        let temp_path = temp_local_path(&destination_path);
+        let destination_path = PathBuf::from(local_path);
+        let temp_path = temp_local_path(&destination_path, job_id);
+        if let Some(parent) = destination_path.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("failed to prepare {}", parent.display()))?;
+        }
 
         match inspect_local_conflict(&destination_path) {
+            Ok(Some(_conflict)) if skip_conflicts && !overwrite_approved => {
+                let _ = sftp.close().await;
+                return Ok(TransferRunOutcome::Skipped);
+            }
             Ok(Some(conflict)) if !overwrite_approved => {
-                return Ok(TransferRunOutcome::AwaitingConflict(conflict));
+                let _ = sftp.close().await;
+                return Ok(TransferRunOutcome::AwaitingConflict(contextualize_conflict(
+                    conflict,
+                    local_path,
+                    remote_path,
+                    "file",
+                )));
             }
             Ok(Some(conflict)) if !conflict.can_overwrite => {
+                let _ = sftp.close().await;
                 return Ok(TransferRunOutcome::Failed(
                     "Warp cannot overwrite a directory destination.".into(),
                 ));
             }
-            Ok(None) => {}
-            Ok(Some(_)) => {}
-            Err(error) => return Ok(TransferRunOutcome::Failed(error.to_string())),
+            Ok(None) | Ok(Some(_)) => {}
+            Err(error) => {
+                let _ = sftp.close().await;
+                return Ok(TransferRunOutcome::Failed(error.to_string()));
+            }
         }
 
         self.mark_running(job_id, metadata.size).await;
@@ -472,7 +686,7 @@ impl TransferManager {
         let mut remote_file = sftp
             .open(remote_path)
             .await
-            .map_err(|error| anyhow!(friendly_remote_transfer_error("open the remote file", error)))?;
+            .map_err(|error| anyhow!(classify_transfer_remote_error("open_file", remote_path, error)))?;
 
         if temp_path.exists() {
             let _ = fs::remove_file(&temp_path).await;
@@ -482,18 +696,19 @@ impl TransferManager {
             .await
             .with_context(|| format!("failed to create {}", temp_path.display()))?;
 
-        let copy_result = self
+        match self
             .copy_stream(job_id, metadata.size, cancel_flag, &mut remote_file, &mut local_file)
-            .await;
-
-        match copy_result {
+            .await
+        {
             Ok(()) => {}
             Err(CopyFailure::Cancelled) => {
                 let _ = fs::remove_file(&temp_path).await;
+                let _ = sftp.close().await;
                 return Ok(TransferRunOutcome::Cancelled);
             }
             Err(CopyFailure::Failed(message)) => {
                 let _ = fs::remove_file(&temp_path).await;
+                let _ = sftp.close().await;
                 return Ok(TransferRunOutcome::Failed(message));
             }
         }
@@ -520,13 +735,13 @@ impl TransferManager {
         Ok(TransferRunOutcome::Succeeded)
     }
 
-    async fn run_upload(
+    async fn run_upload_file(
         &self,
         job_id: &str,
         local_path: &str,
-        local_name: &str,
-        remote_directory: &str,
+        remote_path: &str,
         overwrite_approved: bool,
+        skip_conflicts: bool,
         cancel_flag: Arc<AtomicBool>,
     ) -> Result<TransferRunOutcome> {
         let local_metadata = fs::metadata(local_path)
@@ -535,26 +750,45 @@ impl TransferManager {
 
         if local_metadata.is_dir() {
             return Ok(TransferRunOutcome::Failed(
-                "Warp can only upload files in this milestone.".into(),
+                "Warp does not recurse through symlinked directories during upload.".into(),
             ));
         }
 
         let sftp = self.session_manager.open_transfer_sftp().await?;
-        let destination_path = join_remote_path(remote_directory, local_name);
-        let temp_path = temp_remote_path(remote_directory, local_name, job_id);
+        let remote_parent = parent_remote_path(remote_path);
+        let remote_name = Path::new(remote_path)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("transfer");
+        let temp_path = temp_remote_path(&remote_parent, remote_name, job_id);
 
-        match inspect_remote_conflict(&sftp, &destination_path).await {
+        ensure_remote_directory_chain(&sftp, &remote_parent).await?;
+
+        match inspect_remote_conflict(&sftp, remote_path).await {
+            Ok(Some(_conflict)) if skip_conflicts && !overwrite_approved => {
+                let _ = sftp.close().await;
+                return Ok(TransferRunOutcome::Skipped);
+            }
             Ok(Some(conflict)) if !overwrite_approved => {
-                return Ok(TransferRunOutcome::AwaitingConflict(conflict));
+                let _ = sftp.close().await;
+                return Ok(TransferRunOutcome::AwaitingConflict(contextualize_conflict(
+                    conflict,
+                    local_path,
+                    remote_path,
+                    "file",
+                )));
             }
             Ok(Some(conflict)) if !conflict.can_overwrite => {
+                let _ = sftp.close().await;
                 return Ok(TransferRunOutcome::Failed(
                     "Warp cannot overwrite a directory destination.".into(),
                 ));
             }
-            Ok(None) => {}
-            Ok(Some(_)) => {}
-            Err(error) => return Ok(TransferRunOutcome::Failed(error.to_string())),
+            Ok(None) | Ok(Some(_)) => {}
+            Err(error) => {
+                let _ = sftp.close().await;
+                return Ok(TransferRunOutcome::Failed(error.to_string()));
+            }
         }
 
         self.mark_running(job_id, Some(local_metadata.len())).await;
@@ -565,13 +799,12 @@ impl TransferManager {
         let mut remote_file = sftp
             .create(&temp_path)
             .await
-            .map_err(|error| anyhow!(friendly_remote_transfer_error("create the remote file", error)))?;
+            .map_err(|error| anyhow!(classify_transfer_remote_error("create_file", &temp_path, error)))?;
 
-        let copy_result = self
+        match self
             .copy_stream(job_id, Some(local_metadata.len()), cancel_flag, &mut local_file, &mut remote_file)
-            .await;
-
-        match copy_result {
+            .await
+        {
             Ok(()) => {}
             Err(CopyFailure::Cancelled) => {
                 let _ = remote_file.shutdown().await;
@@ -590,29 +823,32 @@ impl TransferManager {
         remote_file
             .sync_all()
             .await
-            .map_err(|error| anyhow!(friendly_remote_transfer_error("flush the remote file", error)))?;
-        remote_file
-            .shutdown()
-            .await
-            .map_err(|error| anyhow!(friendly_remote_transfer_error("close the remote file", SftpError::IO(error.to_string()))))?;
+            .map_err(|error| anyhow!(classify_transfer_remote_error("flush_file", remote_path, error)))?;
+        remote_file.shutdown().await.map_err(|error| {
+            anyhow!(classify_transfer_remote_error(
+                "close_file",
+                remote_path,
+                SftpError::IO(error.to_string())
+            ))
+        })?;
 
         if overwrite_approved
             && matches!(
-            inspect_remote_conflict(&sftp, &destination_path).await,
-            Ok(Some(TransferConflict {
-                can_overwrite: true,
-                ..
-            }))
-        )
+                inspect_remote_conflict(&sftp, remote_path).await,
+                Ok(Some(TransferConflict {
+                    can_overwrite: true,
+                    ..
+                }))
+            )
         {
-            sftp.remove_file(&destination_path)
+            sftp.remove_file(remote_path)
                 .await
-                .map_err(|error| anyhow!(friendly_remote_transfer_error("replace the remote file", error)))?;
+                .map_err(|error| anyhow!(classify_transfer_remote_error("replace_file", remote_path, error)))?;
         }
 
-        sftp.rename(&temp_path, &destination_path)
+        sftp.rename(&temp_path, remote_path)
             .await
-            .map_err(|error| anyhow!(friendly_remote_transfer_error("finalize the upload", error)))?;
+            .map_err(|error| anyhow!(classify_transfer_remote_error("finalize_upload", remote_path, error)))?;
 
         let _ = sftp.close().await;
         Ok(TransferRunOutcome::Succeeded)
@@ -621,19 +857,25 @@ impl TransferManager {
     async fn mark_running(&self, job_id: &str, bytes_total: Option<u64>) {
         let snapshot = {
             let mut state = self.state.lock().await;
-            if let Some(job) = state.jobs.iter_mut().find(|job| job.id == job_id) {
-                if job.view.state == "Cancelled" {
-                    job.view.rate = None;
-                    job.view.can_cancel = false;
+            if let Some((batch_index, child_index)) = find_child_indices(&state, job_id) {
+                let batch = &mut state.batches[batch_index];
+                let child = &mut batch.children[child_index];
+                if child.view.state == "Cancelled" {
+                    child.view.rate = None;
+                    child.view.can_cancel = false;
                 } else {
-                    job.view.state = "Running".into();
-                    job.view.bytes_total = bytes_total;
-                    job.view.bytes_transferred = 0;
-                    job.view.progress_percent = Some(progress_fraction(0, bytes_total));
-                    job.view.rate = None;
+                    child.view.state = "Running".into();
+                    child.view.bytes_total = bytes_total;
+                    child.view.bytes_transferred = 0;
+                    child.view.progress_percent = Some(progress_fraction(0, bytes_total));
+                    child.view.rate = None;
+                    child.view.can_cancel = true;
+                    child.view.can_retry = false;
+                    batch.view.current_item_label = Some(child.view.name.clone());
+                    refresh_batch_aggregate(batch);
                 }
             }
-            snapshot_from_state(&state)
+            self.snapshot_from_state(&state)
         };
         self.emit_snapshot(snapshot);
     }
@@ -641,28 +883,32 @@ impl TransferManager {
     async fn update_progress(&self, job_id: &str, bytes_transferred: u64, bytes_total: Option<u64>, rate: u64) {
         let snapshot = {
             let mut state = self.state.lock().await;
-            if let Some(job) = state.jobs.iter_mut().find(|job| job.id == job_id) {
-                job.view.bytes_total = bytes_total;
-                job.view.bytes_transferred = bytes_transferred;
-                job.view.progress_percent = Some(progress_fraction(bytes_transferred, bytes_total));
-                job.view.rate = Some(format_rate(rate));
+            if let Some((batch_index, child_index)) = find_child_indices(&state, job_id) {
+                let batch = &mut state.batches[batch_index];
+                let child = &mut batch.children[child_index];
+                child.view.bytes_total = bytes_total;
+                child.view.bytes_transferred = bytes_transferred;
+                child.view.progress_percent = Some(progress_fraction(bytes_transferred, bytes_total));
+                child.view.rate = Some(format_rate(rate));
+                batch.view.current_item_label = Some(child.view.name.clone());
+                refresh_batch_aggregate(batch);
             }
-            snapshot_from_state(&state)
+            self.snapshot_from_state(&state)
         };
         self.emit_snapshot(snapshot);
     }
 
-    async fn copy_stream<R, W>(
+    async fn copy_stream<RR, WW>(
         &self,
         job_id: &str,
         bytes_total: Option<u64>,
         cancel_flag: Arc<AtomicBool>,
-        reader: &mut R,
-        writer: &mut W,
+        reader: &mut RR,
+        writer: &mut WW,
     ) -> Result<(), CopyFailure>
     where
-        R: tokio::io::AsyncRead + Unpin,
-        W: tokio::io::AsyncWrite + Unpin,
+        RR: tokio::io::AsyncRead + Unpin,
+        WW: tokio::io::AsyncWrite + Unpin,
     {
         let mut buffer = vec![0_u8; COPY_BUFFER_SIZE];
         let started_at = Instant::now();
@@ -711,44 +957,744 @@ impl TransferManager {
     fn next_id(&self) -> String {
         format!("tx-{}", self.next_job_id.fetch_add(1, Ordering::Relaxed))
     }
-}
 
-impl TransferRecord {
-    fn with_id(mut self) -> Self {
-        self.view.id = self.id.clone();
-        self
+    fn snapshot_from_state(&self, state: &TransferState) -> TransferQueueSnapshot {
+        let mut snapshot = snapshot_from_state(state);
+        snapshot.sequence = self.next_snapshot_sequence.fetch_add(1, Ordering::Relaxed);
+        snapshot
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn debug_all_jobs(&self) -> Vec<TransferJob> {
+        let state = self.state.lock().await;
+        let mut jobs = Vec::new();
+        for batch in &state.batches {
+            jobs.push(batch.view.clone());
+            jobs.extend(batch.children.iter().map(|child| child.view.clone()));
+        }
+        jobs
     }
 }
 
-enum CopyFailure {
-    Cancelled,
-    Failed(String),
+async fn plan_upload_batch(request: QueueUploadRequest) -> Result<PlannedBatch> {
+    let mut children = Vec::new();
+    let mut total_files = 0_usize;
+    let mut total_directories = 0_usize;
+
+    for entry in &request.entries {
+        let destination_path = join_remote_path(&request.remote_directory, &entry.name);
+        match entry.kind.as_str() {
+            "dir" => {
+                total_directories += 1;
+                children.push(PlannedChild {
+                    item_kind: PlannedItemKind::Directory,
+                    display_name: entry.name.clone(),
+                    source_path: entry.path.clone(),
+                    destination_path: destination_path.clone(),
+                    bytes_total: Some(0),
+                    task: TransferChildTask::CreateRemoteDir {
+                        remote_path: destination_path.clone(),
+                    },
+                });
+                walk_local_directory_upload(&entry.path, &destination_path, &mut children, &mut total_files, &mut total_directories)
+                    .await?;
+            }
+            _ => {
+                total_files += 1;
+                children.push(PlannedChild {
+                    item_kind: PlannedItemKind::File,
+                    display_name: entry.name.clone(),
+                    source_path: entry.path.clone(),
+                    destination_path: destination_path.clone(),
+                    bytes_total: local_planned_size(Path::new(&entry.path)),
+                    task: TransferChildTask::UploadFile {
+                        local_path: entry.path.clone(),
+                        remote_path: destination_path,
+                    },
+                });
+            }
+        }
+    }
+
+    Ok(PlannedBatch {
+        direction: TransferDirection::Upload,
+        destination_root: request.remote_directory,
+        display_name: batch_display_name(&request.entries),
+        source_label: batch_source_label(&request.entries),
+        children,
+        summary: TransferJobSummary {
+            total_files,
+            total_directories,
+            completed_files: 0,
+            failed_files: 0,
+            skipped_files: 0,
+        },
+    })
+}
+
+async fn plan_download_batch<R: Runtime>(
+    session_manager: &Arc<SessionManager<R>>,
+    request: QueueDownloadRequest,
+) -> Result<PlannedBatch>
+{
+    let sftp = session_manager.open_transfer_sftp().await?;
+    let mut children = Vec::new();
+    let mut total_files = 0_usize;
+    let mut total_directories = 0_usize;
+
+    for entry in &request.entries {
+        let destination_path = PathBuf::from(&request.local_directory).join(&entry.name);
+        match entry.kind.as_str() {
+            "dir" => {
+                total_directories += 1;
+                children.push(PlannedChild {
+                    item_kind: PlannedItemKind::Directory,
+                    display_name: entry.name.clone(),
+                    source_path: entry.path.clone(),
+                    destination_path: destination_path.display().to_string(),
+                    bytes_total: Some(0),
+                    task: TransferChildTask::CreateLocalDir {
+                        local_path: destination_path.display().to_string(),
+                    },
+                });
+                walk_remote_directory_download(&sftp, &entry.path, &destination_path, &mut children, &mut total_files, &mut total_directories)
+                    .await?;
+            }
+            _ => {
+                total_files += 1;
+                children.push(PlannedChild {
+                    item_kind: PlannedItemKind::File,
+                    display_name: entry.name.clone(),
+                    source_path: entry.path.clone(),
+                    destination_path: destination_path.display().to_string(),
+                    bytes_total: None,
+                    task: TransferChildTask::DownloadFile {
+                        remote_path: entry.path.clone(),
+                        local_path: destination_path.display().to_string(),
+                    },
+                });
+            }
+        }
+    }
+
+    let _ = sftp.close().await;
+
+    Ok(PlannedBatch {
+        direction: TransferDirection::Download,
+        destination_root: request.local_directory,
+        display_name: batch_display_name(&request.entries),
+        source_label: batch_source_label(&request.entries),
+        children,
+        summary: TransferJobSummary {
+            total_files,
+            total_directories,
+            completed_files: 0,
+            failed_files: 0,
+            skipped_files: 0,
+        },
+    })
+}
+
+async fn walk_local_directory_upload(
+    root_local_path: &str,
+    root_remote_path: &str,
+    children: &mut Vec<PlannedChild>,
+    total_files: &mut usize,
+    total_directories: &mut usize,
+) -> Result<()> {
+    let mut stack = vec![(PathBuf::from(root_local_path), root_remote_path.to_string())];
+
+    while let Some((local_dir, remote_dir)) = stack.pop() {
+        let entries = read_local_dir_entries(&local_dir).await?;
+        for (name, file_type) in entries.into_iter().rev() {
+            let child_local_path = local_dir.join(&name);
+            let child_remote_path = join_remote_path(&remote_dir, &name.to_string_lossy());
+            if file_type.is_dir() {
+                *total_directories += 1;
+                children.push(PlannedChild {
+                    item_kind: PlannedItemKind::Directory,
+                    display_name: name.to_string_lossy().into_owned(),
+                    source_path: child_local_path.display().to_string(),
+                    destination_path: child_remote_path.clone(),
+                    bytes_total: Some(0),
+                    task: TransferChildTask::CreateRemoteDir {
+                        remote_path: child_remote_path.clone(),
+                    },
+                });
+                stack.push((child_local_path, child_remote_path));
+            } else {
+                *total_files += 1;
+                children.push(PlannedChild {
+                    item_kind: PlannedItemKind::File,
+                    display_name: name.to_string_lossy().into_owned(),
+                    source_path: child_local_path.display().to_string(),
+                    destination_path: child_remote_path.clone(),
+                    bytes_total: local_planned_size(&child_local_path),
+                    task: TransferChildTask::UploadFile {
+                        local_path: child_local_path.display().to_string(),
+                        remote_path: child_remote_path,
+                    },
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn walk_remote_directory_download(
+    sftp: &SftpSession,
+    root_remote_path: &str,
+    root_local_path: &Path,
+    children: &mut Vec<PlannedChild>,
+    total_files: &mut usize,
+    total_directories: &mut usize,
+) -> Result<()> {
+    let mut stack = vec![(root_remote_path.to_string(), root_local_path.to_path_buf())];
+
+    while let Some((remote_dir, local_dir)) = stack.pop() {
+        let mut entries = sftp
+            .read_dir(&remote_dir)
+            .await
+            .map_err(|error| anyhow!(friendly_remote_transfer_error("list the remote directory", error)))?
+            .collect::<Vec<SftpDirEntry>>();
+        entries.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
+
+        for entry in entries.into_iter().rev() {
+            let name = entry.file_name();
+            let child_remote_path = RemoteSftpEngine::child_path(&remote_dir, &name)?;
+            let child_local_path = local_dir.join(&name);
+            match entry.file_type() {
+                SftpFileType::Dir => {
+                    *total_directories += 1;
+                    children.push(PlannedChild {
+                        item_kind: PlannedItemKind::Directory,
+                        display_name: name.clone(),
+                        source_path: child_remote_path.clone(),
+                        destination_path: child_local_path.display().to_string(),
+                        bytes_total: Some(0),
+                        task: TransferChildTask::CreateLocalDir {
+                            local_path: child_local_path.display().to_string(),
+                        },
+                    });
+                    stack.push((child_remote_path, child_local_path));
+                }
+                _ => {
+                    *total_files += 1;
+                    children.push(PlannedChild {
+                        item_kind: PlannedItemKind::File,
+                        display_name: name,
+                        source_path: child_remote_path.clone(),
+                        destination_path: child_local_path.display().to_string(),
+                        bytes_total: entry.metadata().size,
+                        task: TransferChildTask::DownloadFile {
+                            remote_path: child_remote_path,
+                            local_path: child_local_path.display().to_string(),
+                        },
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn read_local_dir_entries(path: &Path) -> Result<Vec<(OsString, std::fs::FileType)>> {
+    let mut read_dir = fs::read_dir(path)
+        .await
+        .with_context(|| format!("failed to read directory {}", path.display()))?;
+    let mut entries = Vec::new();
+    while let Some(entry) = read_dir.next_entry().await? {
+        entries.push((entry.file_name(), entry.file_type().await?));
+    }
+    entries.sort_by(|left, right| left.0.to_string_lossy().cmp(&right.0.to_string_lossy()));
+    Ok(entries)
+}
+
+fn local_planned_size(path: &Path) -> Option<u64> {
+    std::fs::metadata(path).ok().and_then(|metadata| if metadata.is_file() { Some(metadata.len()) } else { None })
+}
+
+fn batch_display_name(entries: &[TransferSelectionItem]) -> String {
+    match entries {
+        [entry] => entry.name.clone(),
+        _ => format!("{} items", entries.len()),
+    }
+}
+
+fn batch_source_label(entries: &[TransferSelectionItem]) -> String {
+    match entries {
+        [entry] => entry.path.clone(),
+        _ => format!("{} selected entries", entries.len()),
+    }
 }
 
 fn snapshot_from_state(state: &TransferState) -> TransferQueueSnapshot {
+    let mut jobs = Vec::new();
+    for batch in &state.batches {
+        jobs.push(batch.view.clone());
+    }
+
     TransferQueueSnapshot {
-        jobs: state.jobs.iter().map(|job| job.view.clone()).collect(),
+        sequence: 0,
+        jobs,
         active_job_id: state.active_job_id.clone(),
         queued_count: state
-            .jobs
+            .batches
             .iter()
-            .filter(|job| matches!(job.view.state.as_str(), "Queued" | "Checking" | "AwaitingConflictDecision" | "Running" | "Cancelling"))
-            .count(),
+            .map(|batch| {
+                batch.children
+                    .iter()
+                    .filter(|child| {
+                        matches!(
+                            child.view.state.as_str(),
+                            "Queued" | "Checking" | "AwaitingConflictDecision" | "Running" | "Cancelling"
+                        )
+                    })
+                    .count()
+            })
+            .sum(),
         finished_count: state
-            .jobs
+            .batches
             .iter()
-            .filter(|job| matches!(job.view.state.as_str(), "Succeeded" | "Failed" | "Cancelled"))
+            .filter(|batch| is_terminal_state(&batch.view.state))
             .count(),
+        batch_count: state.batches.len(),
     }
 }
 
+fn next_runnable_child(state: &TransferState) -> Option<(usize, usize)> {
+    for (batch_index, batch) in state.batches.iter().enumerate() {
+        if is_terminal_state(&batch.view.state)
+            || batch.view.state == "AwaitingConflictDecision"
+            || batch.view.state == "PausedDisconnected"
+        {
+            continue;
+        }
+
+        if let Some(child_index) = batch.children.iter().position(|child| child.view.state == "Queued") {
+            return Some((batch_index, child_index));
+        }
+    }
+
+    None
+}
+
+fn cancel_batch_by_id(state: &mut TransferState, job_id: &str) -> bool {
+    let Some(batch) = state.batches.iter_mut().find(|batch| batch.id == job_id) else {
+        return false;
+    };
+
+    batch.cancel_requested = true;
+    batch.pause_message = None;
+    if let Some(active_child) = batch
+        .children
+        .iter_mut()
+        .find(|child| matches!(child.view.state.as_str(), "Checking" | "Running" | "Cancelling"))
+    {
+        active_child.view.state = "Cancelling".into();
+        active_child.view.can_cancel = false;
+        if let Some(flag) = state.cancel_flags.get(&active_child.id) {
+            flag.store(true, Ordering::Relaxed);
+        }
+    }
+
+    for child in &mut batch.children {
+        if matches!(child.view.state.as_str(), "Queued" | "AwaitingConflictDecision") {
+            child.view.state = "Cancelled".into();
+            child.view.conflict = None;
+            child.view.error_message = None;
+            child.view.can_cancel = false;
+            child.view.can_retry = true;
+        }
+    }
+
+    refresh_batch_aggregate(batch);
+    true
+}
+
+fn cancel_child_by_id(state: &mut TransferState, job_id: &str) {
+    let cancel_flag = state.cancel_flags.get(job_id).cloned();
+    let Some((batch_index, child_index)) = find_child_indices(state, job_id) else {
+        return;
+    };
+    let batch = &mut state.batches[batch_index];
+    let child = &mut batch.children[child_index];
+
+    match child.view.state.as_str() {
+        "Queued" | "Checking" | "AwaitingConflictDecision" => {
+            child.view.state = "Cancelled".into();
+            child.view.error_message = None;
+            child.view.conflict = None;
+            child.view.can_cancel = false;
+            child.view.can_retry = true;
+            if let Some(flag) = cancel_flag.as_ref() {
+                flag.store(true, Ordering::Relaxed);
+            }
+        }
+        "Running" | "Cancelling" => {
+            child.view.state = "Cancelling".into();
+            child.view.can_cancel = false;
+            if let Some(flag) = cancel_flag.as_ref() {
+                flag.store(true, Ordering::Relaxed);
+            }
+        }
+        _ => {}
+    }
+
+    refresh_batch_aggregate(batch);
+}
+
+fn retry_batch_by_id(state: &mut TransferState, job_id: &str) -> bool {
+    let Some(batch) = state.batches.iter_mut().find(|batch| batch.id == job_id) else {
+        return false;
+    };
+
+    batch.cancel_requested = false;
+    batch.pause_message = None;
+    batch.conflict_policy = ConflictPolicy::Ask;
+    batch.view.error_message = None;
+    for child in &mut batch.children {
+        if child.view.state != "Succeeded" {
+            reset_child_for_retry(child);
+        }
+    }
+    refresh_batch_aggregate(batch);
+    true
+}
+
+fn retry_child_by_id(state: &mut TransferState, job_id: &str) {
+    let Some((batch_index, child_index)) = find_child_indices(state, job_id) else {
+        return;
+    };
+    let batch = &mut state.batches[batch_index];
+    let child = &mut batch.children[child_index];
+    batch.cancel_requested = false;
+    batch.pause_message = None;
+    batch.view.error_message = None;
+    reset_child_for_retry(child);
+    refresh_batch_aggregate(batch);
+}
+
+fn reset_child_for_retry(child: &mut TransferChildRecord) {
+    child.overwrite_approved = false;
+    child.view.state = "Queued".into();
+    child.view.error_message = None;
+    child.view.conflict = None;
+    child.view.rate = None;
+    child.view.can_cancel = true;
+    child.view.can_retry = false;
+    child.view.bytes_transferred = 0;
+    child.view.progress_percent = Some(progress_fraction(0, child.view.bytes_total));
+}
+
+fn find_child_indices(
+    state: &TransferState,
+    job_id: &str,
+) -> Option<(usize, usize)> {
+    for (batch_index, batch) in state.batches.iter().enumerate() {
+        if let Some(child_index) = batch.children.iter().position(|child| child.id == job_id) {
+            return Some((batch_index, child_index));
+        }
+    }
+    None
+}
+
+fn find_conflict_target_indices(state: &TransferState, job_id: &str) -> Option<(usize, usize)> {
+    if let Some(indices) = find_child_indices(state, job_id) {
+        return Some(indices);
+    }
+
+    state.batches.iter().enumerate().find_map(|(batch_index, batch)| {
+        if batch.id != job_id {
+            return None;
+        }
+
+        batch.children
+            .iter()
+            .position(|child| child.view.state == "AwaitingConflictDecision")
+            .map(|child_index| (batch_index, child_index))
+    })
+}
+
+fn finalize_cancelled_batches(state: &mut TransferState) {
+    for batch in &mut state.batches {
+        if batch.cancel_requested
+            && !batch
+                .children
+                .iter()
+                .any(|child| matches!(child.view.state.as_str(), "Checking" | "Running" | "Cancelling"))
+        {
+            mark_remaining_children_cancelled(batch);
+            refresh_batch_aggregate(batch);
+        }
+    }
+}
+
+fn mark_remaining_children_cancelled(batch: &mut TransferBatchRecord) {
+    for child in &mut batch.children {
+        if matches!(child.view.state.as_str(), "Queued" | "AwaitingConflictDecision" | "Checking") {
+            child.view.state = "Cancelled".into();
+            child.view.conflict = None;
+            child.view.error_message = None;
+            child.view.can_cancel = false;
+            child.view.can_retry = true;
+        }
+    }
+}
+
+fn pause_batches_for_disconnect(state: &mut TransferState, message: &str) {
+    for batch in &mut state.batches {
+        if is_terminal_state(&batch.view.state) {
+            continue;
+        }
+
+        if batch
+            .children
+            .iter()
+            .any(|child| matches!(child.view.state.as_str(), "Queued" | "AwaitingConflictDecision" | "Checking" | "Running" | "Cancelling"))
+        {
+            batch.pause_message = Some(message.into());
+            refresh_batch_aggregate(batch);
+        }
+    }
+}
+
+fn refresh_batch_aggregate(batch: &mut TransferBatchRecord) {
+    let total_files = batch
+        .children
+        .iter()
+        .filter(|child| child.item_kind == PlannedItemKind::File)
+        .count();
+    let total_directories = batch
+        .children
+        .iter()
+        .filter(|child| child.item_kind == PlannedItemKind::Directory)
+        .count();
+    let completed_files = batch
+        .children
+        .iter()
+        .filter(|child| child.item_kind == PlannedItemKind::File && child.view.state == "Succeeded")
+        .count();
+    let failed_files = batch
+        .children
+        .iter()
+        .filter(|child| child.item_kind == PlannedItemKind::File && child.view.state == "Failed")
+        .count();
+    let skipped_files = batch
+        .children
+        .iter()
+        .filter(|child| {
+            child.item_kind == PlannedItemKind::File
+                && matches!(child.view.state.as_str(), "Skipped" | "Cancelled")
+        })
+        .count();
+
+    batch.view.summary = Some(TransferJobSummary {
+        total_files,
+        total_directories,
+        completed_files,
+        failed_files,
+        skipped_files,
+    });
+
+    let conflict_child = batch
+        .children
+        .iter()
+        .find(|child| child.view.state == "AwaitingConflictDecision");
+    let active_child = batch.children.iter().find(|child| {
+        matches!(
+            child.view.state.as_str(),
+            "Checking" | "Running" | "Cancelling"
+        )
+    });
+    batch.view.current_item_label = active_child.map(|child| child.view.name.clone());
+    batch.view.rate = active_child.and_then(|child| child.view.rate.clone());
+    batch.view.conflict = conflict_child.and_then(|child| child.view.conflict.clone());
+
+    let mut total_bytes = 0_u64;
+    let mut all_known = true;
+    let mut transferred_bytes = 0_u64;
+    for child in &batch.children {
+        if child.item_kind == PlannedItemKind::Directory {
+            continue;
+        }
+
+        match child.view.bytes_total {
+            Some(bytes) => total_bytes = total_bytes.saturating_add(bytes),
+            None => all_known = false,
+        }
+
+        transferred_bytes = transferred_bytes.saturating_add(match child.view.state.as_str() {
+            "Succeeded" => child.view.bytes_total.unwrap_or(child.view.bytes_transferred),
+            "Running" | "Checking" | "Cancelling" => child.view.bytes_transferred,
+            _ => 0,
+        });
+    }
+
+    batch.view.bytes_total = if all_known { Some(total_bytes) } else { None };
+    batch.view.bytes_transferred = transferred_bytes;
+    batch.view.progress_percent = Some(if all_known {
+        progress_fraction(transferred_bytes, Some(total_bytes))
+    } else {
+        progress_from_counts(batch)
+    });
+
+    let has_pending = batch
+        .children
+        .iter()
+        .any(|child| matches!(child.view.state.as_str(), "Queued" | "Checking" | "Running" | "Cancelling" | "AwaitingConflictDecision"));
+    let all_cancelled = batch
+        .children
+        .iter()
+        .all(|child| matches!(child.view.state.as_str(), "Cancelled" | "Skipped"));
+    let any_failed = batch.children.iter().any(|child| child.view.state == "Failed");
+    let any_cancelled = batch
+        .children
+        .iter()
+        .any(|child| matches!(child.view.state.as_str(), "Cancelled" | "Skipped"));
+    let any_succeeded = batch.children.iter().any(|child| child.view.state == "Succeeded");
+
+    if batch.pause_message.is_some() {
+        batch.view.state = "PausedDisconnected".into();
+        batch.view.error_message = batch.pause_message.clone();
+        batch.view.can_cancel = true;
+        batch.view.can_retry = true;
+    } else if batch.cancel_requested {
+        if has_pending {
+            batch.view.state = "Cancelling".into();
+            batch.view.error_message = None;
+            batch.view.can_cancel = false;
+            batch.view.can_retry = false;
+        } else {
+            batch.view.state = "Cancelled".into();
+            batch.view.error_message = None;
+            batch.view.can_cancel = false;
+            batch.view.can_retry = !all_cancelled;
+        }
+    } else if batch.children.iter().any(|child| child.view.state == "AwaitingConflictDecision") {
+        batch.view.state = "AwaitingConflictDecision".into();
+        batch.view.error_message = None;
+        batch.view.can_cancel = true;
+        batch.view.can_retry = false;
+    } else if batch
+        .children
+        .iter()
+        .any(|child| matches!(child.view.state.as_str(), "Checking" | "Running" | "Cancelling"))
+    {
+        batch.view.state = if batch
+            .children
+            .iter()
+            .any(|child| child.view.state == "Cancelling")
+        {
+            "Cancelling".into()
+        } else {
+            "Running".into()
+        };
+        batch.view.error_message = None;
+        batch.view.can_cancel = true;
+        batch.view.can_retry = false;
+    } else if has_pending {
+        batch.view.state = "Queued".into();
+        batch.view.error_message = None;
+        batch.view.can_cancel = true;
+        batch.view.can_retry = false;
+    } else if any_failed || any_cancelled {
+        batch.view.state = if any_succeeded { "CompletedWithErrors".into() } else if all_cancelled { "Cancelled".into() } else { "Failed".into() };
+        batch.view.error_message = Some(batch_completion_message(batch));
+        batch.view.can_cancel = false;
+        batch.view.can_retry = true;
+    } else {
+        batch.view.state = "Succeeded".into();
+        batch.view.error_message = None;
+        batch.view.can_cancel = false;
+        batch.view.can_retry = false;
+    }
+}
+
+fn batch_completion_message(batch: &TransferBatchRecord) -> String {
+    let summary = batch.view.summary.clone().unwrap_or(TransferJobSummary {
+        total_files: 0,
+        total_directories: 0,
+        completed_files: 0,
+        failed_files: 0,
+        skipped_files: 0,
+    });
+    if batch.view.state == "PausedDisconnected" {
+        return batch
+            .pause_message
+            .clone()
+            .unwrap_or_else(|| "Reconnect and retry the batch to continue transferring.".into());
+    }
+
+    let mut parts = Vec::new();
+    parts.push(format!("{} completed", summary.completed_files));
+    if summary.failed_files > 0 {
+        parts.push(format!("{} failed", summary.failed_files));
+    }
+    if summary.skipped_files > 0 {
+        parts.push(format!("{} skipped", summary.skipped_files));
+    }
+    parts.join(", ")
+}
+
+fn progress_from_counts(batch: &TransferBatchRecord) -> u8 {
+    let total = batch.children.len() as f32;
+    if total == 0.0 {
+        return 100;
+    }
+
+    let mut completed = 0_f32;
+    for child in &batch.children {
+        completed += match child.view.state.as_str() {
+            "Succeeded" | "Failed" | "Skipped" | "Cancelled" => 1.0,
+            "Running" | "Checking" | "Cancelling" => child.view.progress_percent.unwrap_or(0) as f32 / 100.0,
+            _ => 0.0,
+        };
+    }
+
+    ((completed / total) * 100.0).round().clamp(0.0, 100.0) as u8
+}
+
 fn is_terminal_state(state: &str) -> bool {
-    matches!(state, "Succeeded" | "Failed" | "Cancelled")
+    matches!(state, "Succeeded" | "Failed" | "Cancelled" | "CompletedWithErrors")
 }
 
 fn is_session_loss_message(message: &str) -> bool {
     let message = message.to_lowercase();
     message.contains("ssh session ended") || message.contains("connection lost after idle")
+}
+
+fn contextualize_conflict(
+    mut conflict: TransferConflict,
+    source_path: &str,
+    destination_path: &str,
+    source_kind: &str,
+) -> TransferConflict {
+    conflict.source_kind = source_kind.into();
+    conflict.source_path = source_path.into();
+    conflict.source_name = Path::new(source_path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(source_path)
+        .into();
+    conflict.destination_path = destination_path.into();
+    conflict.destination_name = Path::new(destination_path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(destination_path)
+        .into();
+    conflict.conflict_kind = if conflict.destination_kind == "dir" && source_kind != "dir" {
+        "typeMismatch".into()
+    } else if conflict.destination_kind == "file" && source_kind == "file" {
+        "fileExists".into()
+    } else if conflict.destination_kind == "dir" && source_kind == "dir" {
+        "dirExists".into()
+    } else {
+        "unknown".into()
+    };
+    conflict
 }
 
 fn inspect_local_conflict(destination_path: &Path) -> Result<Option<TransferConflict>> {
@@ -762,7 +1708,22 @@ fn inspect_local_conflict(destination_path: &Path) -> Result<Option<TransferConf
             } else {
                 "file".into()
             },
+            source_kind: "unknown".into(),
+            source_name: String::new(),
+            source_path: String::new(),
+            destination_name: destination_path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .into(),
+            destination_path: destination_path.display().to_string(),
+            conflict_kind: if metadata.file_type().is_dir() {
+                "typeMismatch".into()
+            } else {
+                "fileExists".into()
+            },
             can_overwrite: !metadata.file_type().is_dir(),
+            apply_to_remaining: true,
         })),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(anyhow!(
@@ -787,7 +1748,22 @@ async fn inspect_remote_conflict(
             } else {
                 "file".into()
             },
+            source_kind: "unknown".into(),
+            source_name: String::new(),
+            source_path: String::new(),
+            destination_name: Path::new(destination_path)
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .into(),
+            destination_path: destination_path.into(),
+            conflict_kind: if metadata.is_dir() {
+                "typeMismatch".into()
+            } else {
+                "fileExists".into()
+            },
             can_overwrite: !metadata.is_dir(),
+            apply_to_remaining: true,
         })),
         Err(SftpError::Status(status))
             if matches!(status.status_code, russh_sftp::protocol::StatusCode::NoSuchFile) =>
@@ -801,12 +1777,38 @@ async fn inspect_remote_conflict(
     }
 }
 
-fn temp_local_path(destination_path: &Path) -> PathBuf {
+async fn ensure_remote_directory_chain(sftp: &SftpSession, path: &str) -> Result<()> {
+    let normalized = normalize_remote_directory_path(path);
+    if normalized == "/" {
+        return Ok(());
+    }
+
+    let mut current = String::from("/");
+    for segment in normalized.split('/').filter(|segment| !segment.is_empty()) {
+        current = join_remote_path(&current, segment);
+
+        match inspect_remote_conflict(sftp, &current).await? {
+            Some(conflict) if conflict.destination_kind == "dir" => continue,
+            Some(_) => {
+                bail!("Warp cannot create a remote folder because `{current}` already exists as a file.")
+            }
+            None => {
+                sftp.create_dir(&current)
+                    .await
+                    .map_err(|error| anyhow!(classify_transfer_remote_error("create_dir", &current, error)))?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn temp_local_path(destination_path: &Path, job_id: &str) -> PathBuf {
     let name = destination_path
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("transfer");
-    destination_path.with_file_name(format!(".{name}.warp-part"))
+    destination_path.with_file_name(format!(".{name}.warp-part-{job_id}"))
 }
 
 fn temp_remote_path(remote_directory: &str, local_name: &str, job_id: &str) -> String {
@@ -819,6 +1821,19 @@ fn join_remote_path(parent: &str, name: &str) -> String {
     } else {
         format!("{}/{}", parent.trim_end_matches('/'), name)
     }
+}
+
+fn normalize_remote_directory_path(path: &str) -> String {
+    let trimmed = path.trim();
+    if trimmed.is_empty() || trimmed == "/" {
+        "/".into()
+    } else {
+        format!("/{}", trimmed.trim_matches('/'))
+    }
+}
+
+fn parent_remote_path(path: &str) -> String {
+    RemoteSftpEngine::parent_path(path).unwrap_or_else(|| "/".into())
 }
 
 fn progress_fraction(bytes_transferred: u64, bytes_total: Option<u64>) -> u8 {
@@ -891,9 +1906,72 @@ fn friendly_remote_transfer_error(action: &str, error: SftpError) -> String {
     error.to_string()
 }
 
+fn classify_transfer_remote_error(action: &str, path: &str, error: SftpError) -> String {
+    match error {
+        SftpError::Status(status) => match status.status_code {
+            russh_sftp::protocol::StatusCode::PermissionDenied => match action {
+                "create_dir" => format!("Permission denied while preparing remote folder `{path}`."),
+                "create_file" | "flush_file" | "replace_file" | "finalize_upload" => {
+                    format!("Permission denied while writing remote file `{path}`.")
+                }
+                _ => format!("Permission denied while accessing remote path `{path}`."),
+            },
+            russh_sftp::protocol::StatusCode::NoSuchFile => match action {
+                "create_dir" => format!("The remote parent path for `{path}` is no longer available."),
+                "create_file" | "finalize_upload" => {
+                    format!("The remote parent path for `{path}` is no longer available, so Warp could not upload the file.")
+                }
+                "inspect_file" | "open_file" => {
+                    format!("The remote file `{path}` is no longer available.")
+                }
+                _ => format!("The remote path `{path}` is no longer available."),
+            },
+            russh_sftp::protocol::StatusCode::ConnectionLost | russh_sftp::protocol::StatusCode::NoConnection => {
+                format!("The SSH session ended while accessing remote path `{path}`.")
+            }
+            russh_sftp::protocol::StatusCode::Failure => {
+                let message = status.error_message.trim();
+                if message.is_empty() || message.eq_ignore_ascii_case("failure") {
+                    match action {
+                        "create_dir" => format!("The server could not create remote folder `{path}`."),
+                        "create_file" => format!("The server could not create the remote upload target `{path}`."),
+                        "flush_file" => format!("The server could not finish writing remote file `{path}`."),
+                        "close_file" => format!("The server could not close remote file `{path}` cleanly after writing."),
+                        "replace_file" => format!("The server could not replace the existing remote file at `{path}`."),
+                        "finalize_upload" => format!("The server could not finalize the upload for `{path}`."),
+                        "inspect_file" | "open_file" => format!("The server could not access remote file `{path}`."),
+                        _ => format!("The server could not complete the remote operation for `{path}`."),
+                    }
+                } else {
+                    message.into()
+                }
+            }
+            _ => {
+                let message = status.error_message.trim();
+                if message.is_empty() {
+                    format!("Remote operation failed for `{path}` ({})", status.status_code)
+                } else {
+                    format!("{} ({})", message, status.status_code)
+                }
+            }
+        },
+        other => friendly_remote_transfer_error("access the remote path", other),
+    }
+}
+
+impl TransferDirection {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Upload => "Upload",
+            Self::Download => "Download",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{format_rate, join_remote_path};
+    use super::{batch_display_name, format_rate, join_remote_path, progress_fraction};
+    use crate::models::TransferSelectionItem;
 
     #[test]
     fn joins_remote_paths_without_double_slashes() {
@@ -905,5 +1983,27 @@ mod tests {
     fn formats_transfer_rates() {
         assert_eq!(format_rate(900), "900 B/s");
         assert_eq!(format_rate(2048), "2.0 KB/s");
+    }
+
+    #[test]
+    fn reports_progress_for_zero_byte_items() {
+        assert_eq!(progress_fraction(0, Some(0)), 100);
+    }
+
+    #[test]
+    fn labels_multi_entry_batches() {
+        let entries = vec![
+            TransferSelectionItem {
+                path: "/tmp/a".into(),
+                name: "a".into(),
+                kind: "file".into(),
+            },
+            TransferSelectionItem {
+                path: "/tmp/b".into(),
+                name: "b".into(),
+                kind: "file".into(),
+            },
+        ];
+        assert_eq!(batch_display_name(&entries), "2 items");
     }
 }

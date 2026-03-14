@@ -78,6 +78,21 @@ impl LocalFilesystem {
 
     pub fn delete_entry(&self, path: &str, entry_name: &str) -> Result<PaneSnapshot> {
         let base = self.resolve_directory(Some(path))?;
+        self.delete_entry_at_path(&base, entry_name)?;
+
+        self.snapshot_for_directory(&base)
+    }
+
+    pub fn delete_entries(&self, path: &str, entry_names: &[String]) -> Result<PaneSnapshot> {
+        let base = self.resolve_directory(Some(path))?;
+        for entry_name in entry_names {
+            self.delete_entry_at_path(&base, entry_name)?;
+        }
+
+        self.snapshot_for_directory(&base)
+    }
+
+    fn delete_entry_at_path(&self, base: &Path, entry_name: &str) -> Result<()> {
         let target = base.join(entry_name);
         let metadata = fs::symlink_metadata(&target)
             .with_context(|| format!("failed to access {}", target.display()))?;
@@ -90,7 +105,7 @@ impl LocalFilesystem {
                 .with_context(|| format!("failed to remove file {}", target.display()))?;
         }
 
-        self.snapshot_for_directory(&base)
+        Ok(())
     }
 
     fn resolve_directory(&self, path: Option<&str>) -> Result<PathBuf> {

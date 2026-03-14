@@ -3,10 +3,10 @@ use tauri::State;
 use crate::{
     local_fs::LocalFilesystem,
     models::{
-        AppBootstrap, ConnectRequest, CreateRemoteDirectoryRequest, DeleteRemoteEntryRequest,
-        PaneSet, PaneSnapshot, QueueDownloadRequest, QueueUploadRequest, RemoteConnectionSnapshot,
-        RemoteDeleteResponse, RenameRemoteEntryRequest, TransferConflictResolution,
-        TransferQueueSnapshot, TrustDecision,
+        AppBootstrap, ConnectRequest, CreateRemoteDirectoryRequest, DeleteLocalEntriesRequest,
+        DeleteRemoteEntriesRequest, DeleteRemoteEntryRequest, PaneSet, PaneSnapshot,
+        QueueDownloadRequest, QueueUploadRequest, RemoteConnectionSnapshot, RemoteDeleteResponse,
+        RenameRemoteEntryRequest, TransferConflictResolution, TransferQueueSnapshot, TrustDecision,
     },
     session::SessionManager,
     transfer::TransferManager,
@@ -81,13 +81,12 @@ pub fn rename_local_entry(
 }
 
 #[tauri::command]
-pub fn delete_local_entry(
+pub fn delete_local_entries(
     local_fs: State<'_, LocalFilesystem>,
-    path: String,
-    entry_name: String,
+    request: DeleteLocalEntriesRequest,
 ) -> Result<PaneSnapshot, String> {
     local_fs
-        .delete_entry(&path, &entry_name)
+        .delete_entries(&request.path, &request.entry_names)
         .map_err(|error| error.to_string())
 }
 
@@ -188,6 +187,17 @@ pub async fn delete_remote_entry(
 }
 
 #[tauri::command]
+pub async fn delete_remote_entries(
+    session_manager: State<'_, std::sync::Arc<SessionManager>>,
+    request: DeleteRemoteEntriesRequest,
+) -> Result<RemoteDeleteResponse, String> {
+    session_manager
+        .delete_remote_entries(request)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 pub async fn queue_download(
     transfer_manager: State<'_, std::sync::Arc<TransferManager>>,
     request: QueueDownloadRequest,
@@ -222,6 +232,14 @@ pub async fn cancel_transfer(
     job_id: String,
 ) -> Result<TransferQueueSnapshot, String> {
     Ok(transfer_manager.cancel_transfer(&job_id).await)
+}
+
+#[tauri::command]
+pub async fn retry_transfer(
+    transfer_manager: State<'_, std::sync::Arc<TransferManager>>,
+    job_id: String,
+) -> Result<TransferQueueSnapshot, String> {
+    Ok(transfer_manager.retry_transfer(&job_id).await)
 }
 
 #[tauri::command]

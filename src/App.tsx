@@ -6,13 +6,15 @@ import {
   clearCompletedTransfers,
   connectRemote,
   createRemoteDirectory,
+  deleteLocalEntries,
+  deleteRemoteEntries,
   deleteRemoteEntry,
-  deleteLocalEntry,
   disconnectRemote,
   goUpLocalDirectory,
   goUpRemoteDirectory,
   queueDownload,
   queueUpload,
+  retryTransfer,
   listLocalDirectory,
   openLocalDirectory,
   openRemoteDirectory,
@@ -25,12 +27,14 @@ import {
 import type {
   AppBootstrap,
   ConnectRequest,
+  DeleteRemoteEntryTarget,
   FileEntry,
   PaneId,
   PaneSnapshot,
   RemoteDeletePrompt,
   TransferQueueSnapshot,
   RemoteConnectionSnapshot,
+  TransferSelectionItem,
   TransferJob,
   TrustPrompt,
 } from './lib/types'
@@ -67,10 +71,12 @@ const defaultState: AppBootstrap = {
     },
   },
   transfers: {
+    sequence: 0,
     jobs: [],
     activeJobId: null,
     queuedCount: 0,
     finishedCount: 0,
+    batchCount: 0,
   },
   shortcuts: [],
 }
@@ -134,17 +140,59 @@ function transferStateLabel(state: TransferJob['state']) {
   switch (state) {
     case 'AwaitingConflictDecision':
       return 'Conflict'
+    case 'CompletedWithErrors':
+      return 'Partial'
+    case 'PausedDisconnected':
+      return 'Paused'
     default:
       return state
   }
 }
 
-function parentDirectory(path: string) {
-  if (!path || path === '/' || path === 'Not connected') return path
-  const normalized = path.endsWith('/') && path !== '/' ? path.slice(0, -1) : path
-  const index = normalized.lastIndexOf('/')
-  if (index <= 0) return normalized.startsWith('/') ? '/' : '.'
-  return normalized.slice(0, index)
+function primarySelection(selection: string[]) {
+  return selection[0] ?? null
+}
+
+function summarizeTransfer(job: TransferJob) {
+  if (!job.summary) return null
+  const parts = [`${job.summary.totalFiles} files`]
+  if (job.summary.totalDirectories > 0) {
+    parts.push(`${job.summary.totalDirectories} folders`)
+  }
+  if (job.state === 'CompletedWithErrors' || job.state === 'Failed' || job.state === 'Cancelled') {
+    if (job.summary.completedFiles > 0) parts.push(`${job.summary.completedFiles} done`)
+    if (job.summary.failedFiles > 0) parts.push(`${job.summary.failedFiles} failed`)
+    if (job.summary.skippedFiles > 0) parts.push(`${job.summary.skippedFiles} skipped`)
+  }
+  return parts.join(' / ')
+}
+
+function basename(path: string) {
+  const normalized = path.replace(/\/+$/, '')
+  const parts = normalized.split('/')
+  return parts[parts.length - 1] || path
+}
+
+function transferConflictLabel(conflict: TransferJob['conflict']) {
+  if (!conflict) return null
+  switch (conflict.conflictKind) {
+    case 'typeMismatch':
+      return `Destination exists as ${conflict.destinationKind === 'dir' ? 'a directory' : 'a file'}.`
+    case 'dirExists':
+      return 'Destination directory already exists.'
+    case 'fileExists':
+      return `Destination exists as ${conflict.destinationKind === 'dir' ? 'a directory' : 'a file'}.`
+    default:
+      return 'Destination already exists.'
+  }
+}
+
+function selectionItems(entries: FileEntry[]): TransferSelectionItem[] {
+  return entries.map((entry) => ({
+    path: entry.path,
+    name: entry.name,
+    kind: entry.kind,
+  }))
 }
 
 function isEditableTarget(target: EventTarget | null) {
@@ -191,8 +239,11 @@ function App() {
   const [dragging, setDragging] = createSignal(false)
   const [localFilter, setLocalFilter] = createSignal('')
   const [remoteFilter, setRemoteFilter] = createSignal('')
-  const [localSelection, setLocalSelection] = createSignal<string | null>(null)
-  const [remoteSelection, setRemoteSelection] = createSignal<string | null>(null)
+  const [localSelection, setLocalSelection] = createSignal<string[]>([])
+  const [remoteSelection, setRemoteSelection] = createSignal<string[]>([])
+  const [localSelectionAnchor, setLocalSelectionAnchor] = createSignal<string | null>(null)
+  const [remoteSelectionAnchor, setRemoteSelectionAnchor] = createSignal<string | null>(null)
+  const [latestTransferSequence, setLatestTransferSequence] = createSignal(0)
   const [localLoading, setLocalLoading] = createSignal(false)
   const [remoteLoading, setRemoteLoading] = createSignal(false)
   const [localError, setLocalError] = createSignal<string | null>(null)
@@ -206,7 +257,7 @@ function App() {
   const [createDirectoryDraft, setCreateDirectoryDraft] = createSignal('')
   const [pendingDeleteTarget, setPendingDeleteTarget] = createSignal<{
     paneId: PaneId
-    entry: FileEntry
+    entries: FileEntry[]
     recursive: boolean
     message?: string
   } | null>(null)
@@ -226,31 +277,43 @@ function App() {
   let deleteConfirmButton: HTMLButtonElement | undefined
 
   const localSelectedEntry = createMemo(() => {
-    const selection = localSelection()
+    const selection = localSelection()[0]
     if (!selection) return null
     return localPane().entries.find((entry) => entry.name === selection) ?? null
   })
 
   const remoteSelectedEntry = createMemo(() => {
-    const selection = remoteSelection()
+    const selection = remoteSelection()[0]
     if (!selection) return null
     return remotePane().entries.find((entry) => entry.name === selection) ?? null
   })
 
   const applyTransferSnapshot = (snapshot: TransferQueueSnapshot) => {
+    if (snapshot.sequence < latestTransferSequence()) {
+      return
+    }
+
+    setLatestTransferSequence(snapshot.sequence)
     const previousJobs = new Map(transfers().jobs.map((job) => [job.id, job.state]))
     setTransfers(snapshot)
 
     for (const job of snapshot.jobs) {
-      if (job.state !== 'Succeeded' || previousJobs.get(job.id) === 'Succeeded') {
+      if (job.kind !== 'batch') {
         continue
       }
 
-      if (job.direction === 'Download' && parentDirectory(job.destinationPath) === localPane().location) {
+      if (
+        !['Succeeded', 'CompletedWithErrors', 'Cancelled'].includes(job.state) ||
+        previousJobs.get(job.id) === job.state
+      ) {
+        continue
+      }
+
+      if (job.direction === 'Download' && job.destinationPath === localPane().location) {
         void refreshPane('local')
       }
 
-      if (job.direction === 'Upload' && parentDirectory(job.destinationPath) === remotePane().location) {
+      if (job.direction === 'Upload' && job.destinationPath === remotePane().location) {
         void refreshPane('remote')
       }
     }
@@ -258,17 +321,19 @@ function App() {
 
   const handleRemoteSessionUpdate = (snapshot: RemoteConnectionSnapshot) => {
     setRemoteLoading(false)
-    applyRemoteSnapshot(snapshot, remoteSelection())
+    applyRemoteSnapshot(snapshot, primarySelection(remoteSelection()))
     if (snapshot.session.connectionState === 'Disconnected') {
       clearPaneTransientUi('remote')
       setTrustPrompt(null)
-      setRemoteSelection(null)
+      setRemoteSelection([])
+      setRemoteSelectionAnchor(null)
     }
   }
 
   const clearRemoteTransientState = (emptyMessage: string) => {
     setRemotePane(remotePlaceholder(emptyMessage))
-    setRemoteSelection(null)
+    setRemoteSelection([])
+    setRemoteSelectionAnchor(null)
   }
 
   const setTransientRemoteSession = (connectionState: string, trustState: string, hostOverride?: string) => {
@@ -400,7 +465,8 @@ function App() {
     try {
       const snapshot = await disconnectRemote()
       applyRemoteSnapshot(snapshot, null)
-      setRemoteSelection(null)
+      setRemoteSelection([])
+      setRemoteSelectionAnchor(null)
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Failed to disconnect remote session.'
       setConnectError(message)
@@ -469,14 +535,24 @@ function App() {
       : 'border-white/10 bg-white/[0.015]'
 
   const selectionForPane = (paneId: PaneId) => (paneId === 'local' ? localSelection() : remoteSelection())
+  const selectionAnchorForPane = (paneId: PaneId) => (paneId === 'local' ? localSelectionAnchor() : remoteSelectionAnchor())
 
-  const setSelectionForPane = (paneId: PaneId, value: string | null) => {
+  const setSelectionForPane = (paneId: PaneId, value: string[]) => {
     if (paneId === 'local') {
       setLocalSelection(value)
       return
     }
 
     setRemoteSelection(value)
+  }
+
+  const setSelectionAnchorForPane = (paneId: PaneId, value: string | null) => {
+    if (paneId === 'local') {
+      setLocalSelectionAnchor(value)
+      return
+    }
+
+    setRemoteSelectionAnchor(value)
   }
 
   const selectedEntryForPane = (paneId: PaneId) => (paneId === 'local' ? localSelectedEntry() : remoteSelectedEntry())
@@ -500,13 +576,48 @@ function App() {
   }
 
   const syncSelection = (paneId: PaneId, pane: PaneSnapshot, preferredName: string | null) => {
-    const currentSelection = selectionForPane(paneId)
-    const nextSelection =
-      [preferredName, currentSelection]
-        .filter((value): value is string => Boolean(value))
-        .find((value) => pane.entries.some((entry) => entry.name === value)) ?? pane.entries[0]?.name ?? null
+    const currentSelection = selectionForPane(paneId).filter((value) => pane.entries.some((entry) => entry.name === value))
+    const preferred = preferredName && pane.entries.some((entry) => entry.name === preferredName) ? [preferredName] : []
+    const nextSelection = preferred.length > 0 ? preferred : currentSelection.length > 0 ? currentSelection : pane.entries[0] ? [pane.entries[0].name] : []
 
     setSelectionForPane(paneId, nextSelection)
+    setSelectionAnchorForPane(paneId, nextSelection[0] ?? null)
+  }
+
+  const selectedEntriesForPane = (paneId: PaneId) => {
+    const pane = paneId === 'local' ? localPane() : remotePane()
+    const selectedNames = new Set(selectionForPane(paneId))
+    return pane.entries.filter((entry) => selectedNames.has(entry.name))
+  }
+
+  const selectEntry = (paneId: PaneId, entry: FileEntry, event?: MouseEvent) => {
+    const entries = paneId === 'local' ? localEntries() : remoteEntries()
+    const currentSelection = selectionForPane(paneId)
+    const currentAnchor = selectionAnchorForPane(paneId)
+
+    if (event?.shiftKey) {
+      const anchorName = currentAnchor ?? currentSelection[0] ?? entry.name
+      const anchorIndex = entries.findIndex((item) => item.name === anchorName)
+      const targetIndex = entries.findIndex((item) => item.name === entry.name)
+      if (anchorIndex !== -1 && targetIndex !== -1) {
+        const start = Math.min(anchorIndex, targetIndex)
+        const end = Math.max(anchorIndex, targetIndex)
+        const range = entries.slice(start, end + 1).map((item) => item.name)
+        setSelectionForPane(paneId, range)
+        setSelectionAnchorForPane(paneId, anchorName)
+      }
+    } else if (event?.metaKey || event?.ctrlKey) {
+      const next = currentSelection.includes(entry.name)
+        ? currentSelection.filter((value) => value !== entry.name)
+        : [entry.name, ...currentSelection.filter((value) => value !== entry.name)]
+      setSelectionForPane(paneId, next)
+      setSelectionAnchorForPane(paneId, entry.name)
+    } else {
+      setSelectionForPane(paneId, [entry.name])
+      setSelectionAnchorForPane(paneId, entry.name)
+    }
+
+    activatePane(paneId)
   }
 
   const setPaneSnapshot = (paneId: PaneId, pane: PaneSnapshot, preferredName: string | null) => {
@@ -560,7 +671,7 @@ function App() {
 
       try {
         const nextPane = await listLocalDirectory(localPane().location)
-        setPaneSnapshot('local', nextPane, localSelection())
+        setPaneSnapshot('local', nextPane, primarySelection(localSelection()))
       } catch (error) {
         setLocalError(error instanceof Error ? error.message : 'Failed to refresh local directory.')
       } finally {
@@ -578,7 +689,7 @@ function App() {
 
     try {
       const snapshot = await refreshRemoteDirectory()
-      applyRemoteSnapshot(snapshot, remoteSelection())
+      applyRemoteSnapshot(snapshot, primarySelection(remoteSelection()))
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Failed to refresh remote directory.'
       setRemoteRuntimeError(message)
@@ -589,7 +700,8 @@ function App() {
   }
 
   const openEntry = async (paneId: PaneId, entry: FileEntry) => {
-    setSelectionForPane(paneId, entry.name)
+    setSelectionForPane(paneId, [entry.name])
+    setSelectionAnchorForPane(paneId, entry.name)
     activatePane(paneId)
 
     if (entry.kind !== 'dir') return
@@ -675,16 +787,18 @@ function App() {
     const entries = paneId === 'local' ? localEntries() : remoteEntries()
     if (entries.length === 0) return
 
-    const currentSelection = selectionForPane(paneId)
+    const currentSelection = primarySelection(selectionForPane(paneId))
     const currentIndex = entries.findIndex((entry) => entry.name === currentSelection)
     const nextIndex = currentIndex === -1 ? 0 : Math.min(entries.length - 1, Math.max(0, currentIndex + delta))
-    setSelectionForPane(paneId, entries[nextIndex]?.name ?? null)
+    const nextName = entries[nextIndex]?.name
+    setSelectionForPane(paneId, nextName ? [nextName] : [])
+    setSelectionAnchorForPane(paneId, nextName ?? null)
     activatePane(paneId)
   }
 
   const openSelectedEntry = async (paneId: PaneId) => {
     const entries = paneId === 'local' ? localEntries() : remoteEntries()
-    const selection = selectionForPane(paneId)
+    const selection = primarySelection(selectionForPane(paneId))
     const entry = entries.find((item) => item.name === selection) ?? entries[0]
 
     if (!entry) return
@@ -692,6 +806,7 @@ function App() {
   }
 
   const startInlineRename = (paneId: PaneId) => {
+    if (selectedCount(paneId) !== 1) return
     const entry = selectedEntryForPane(paneId)
     if (!entry) return
 
@@ -804,19 +919,19 @@ function App() {
   }
 
   const openDeleteConfirmation = (paneId: PaneId) => {
-    const entry = selectedEntryForPane(paneId)
-    if (!entry) return
+    const entries = selectedEntriesForPane(paneId)
+    if (entries.length === 0) return
 
     cancelInlineRename(paneId)
     cancelCreateDirectory(paneId)
-    setPendingDeleteTarget({ paneId, entry, recursive: false })
+    setPendingDeleteTarget({ paneId, entries, recursive: false })
     queueMicrotask(() => deleteConfirmButton?.focus())
   }
 
-  const applyRemoteDeletePrompt = (prompt: RemoteDeletePrompt, entry: FileEntry) => {
+  const applyRemoteDeletePrompt = (prompt: RemoteDeletePrompt, entries: FileEntry[]) => {
     setPendingDeleteTarget({
       paneId: 'remote',
-      entry,
+      entries,
       recursive: prompt.requiresRecursive,
       message: prompt.message,
     })
@@ -832,7 +947,10 @@ function App() {
       setLocalError(null)
 
       try {
-        const nextPane = await deleteLocalEntry(localPane().location, target.entry.name)
+        const nextPane = await deleteLocalEntries({
+          path: localPane().location,
+          entryNames: target.entries.map((entry) => entry.name),
+        })
         setPaneSnapshot('local', nextPane, null)
         closeDeleteConfirmation('local')
       } catch (error) {
@@ -849,16 +967,27 @@ function App() {
     setConnectError(null)
 
     try {
-      const response = await deleteRemoteEntry({
-        parentPath: remotePane().location,
-        entryName: target.entry.name,
-        entryKind: target.entry.kind,
-        recursive: target.recursive,
-      })
+      const response =
+        target.entries.length === 1
+          ? await deleteRemoteEntry({
+              parentPath: remotePane().location,
+              entryName: target.entries[0].name,
+              entryKind: target.entries[0].kind,
+              recursive: target.recursive,
+            })
+          : await deleteRemoteEntries({
+              parentPath: remotePane().location,
+              entries: target.entries.map<DeleteRemoteEntryTarget>((entry) => ({
+                entryName: entry.name,
+                entryKind: entry.kind,
+              })),
+              recursive: target.recursive,
+            })
+
 
       if (response.prompt) {
-        applyRemoteSnapshot(response.snapshot, target.entry.name)
-        applyRemoteDeletePrompt(response.prompt, target.entry)
+        applyRemoteSnapshot(response.snapshot, target.entries[0]?.name ?? null)
+        applyRemoteDeletePrompt(response.prompt, target.entries)
       } else {
         applyRemoteSnapshot(response.snapshot, null)
         closeDeleteConfirmation('remote')
@@ -872,27 +1001,26 @@ function App() {
   }
 
   const uploadCandidate = createMemo(() => {
-    const entry = localSelectedEntry()
-    if (!entry || entry.kind !== 'file') return null
-    if (session().connectionState !== 'Connected' || remotePane().location === 'Not connected') return null
-    return entry
+    const entries = selectedEntriesForPane('local')
+    if (entries.length === 0) return []
+    if (session().connectionState !== 'Connected' || remotePane().location === 'Not connected') return []
+    return entries
   })
 
   const downloadCandidate = createMemo(() => {
-    const entry = remoteSelectedEntry()
-    if (!entry || entry.kind !== 'file') return null
-    if (session().connectionState !== 'Connected') return null
-    return entry
+    const entries = selectedEntriesForPane('remote')
+    if (entries.length === 0) return []
+    if (session().connectionState !== 'Connected') return []
+    return entries
   })
 
   const queueSelectedUpload = async () => {
-    const entry = uploadCandidate()
-    if (!entry) return
+    const entries = uploadCandidate()
+    if (entries.length === 0) return
 
     try {
       const snapshot = await queueUpload({
-        localPath: entry.path,
-        localName: entry.name,
+        entries: selectionItems(entries),
         remoteDirectory: remotePane().location,
       })
       applyTransferSnapshot(snapshot)
@@ -902,13 +1030,12 @@ function App() {
   }
 
   const queueSelectedDownload = async () => {
-    const entry = downloadCandidate()
-    if (!entry) return
+    const entries = downloadCandidate()
+    if (entries.length === 0) return
 
     try {
       const snapshot = await queueDownload({
-        remotePath: entry.path,
-        remoteName: entry.name,
+        entries: selectionItems(entries),
         localDirectory: localPane().location,
       })
       applyTransferSnapshot(snapshot)
@@ -927,7 +1054,20 @@ function App() {
     }
   }
 
-  const resolveTransferJobConflict = async (jobId: string, action: 'overwrite' | 'cancel') => {
+  const retryTransferJob = async (jobId: string) => {
+    try {
+      const snapshot = await retryTransfer(jobId)
+      applyTransferSnapshot(snapshot)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to retry transfer.'
+      setRemoteRuntimeError(message)
+    }
+  }
+
+  const resolveTransferJobConflict = async (
+    jobId: string,
+    action: 'overwrite' | 'skip' | 'overwriteAll' | 'skipAll' | 'cancelBatch',
+  ) => {
     try {
       const snapshot = await resolveTransferConflict(jobId, { action })
       applyTransferSnapshot(snapshot)
@@ -949,8 +1089,8 @@ function App() {
 
   const selectedCount = (paneId: PaneId) => {
     const pane = paneId === 'local' ? localPane() : remotePane()
-    const selection = selectionForPane(paneId)
-    return selection !== null && pane.entries.some((entry) => entry.name === selection) ? 1 : 0
+    const selectedNames = new Set(selectionForPane(paneId))
+    return pane.entries.filter((entry) => selectedNames.has(entry.name)).length
   }
 
   const handleShortcut = (event: KeyboardEvent) => {
@@ -1202,7 +1342,7 @@ function App() {
                   active={activePane() === 'local'}
                   paneClass={paneClass('local')}
                   filterValue={localFilter()}
-                  selectedName={localSelection()}
+                  selectedNames={localSelection()}
                   loading={localLoading()}
                   errorMessage={localError()}
                   editingName={renamingPane() === 'local' ? renamingEntryName() : null}
@@ -1226,10 +1366,7 @@ function App() {
                   }}
                   onFilter={setLocalFilter}
                   onFocus={() => activatePane('local')}
-                  onSelect={(entry) => {
-                    setLocalSelection(entry.name)
-                    activatePane('local')
-                  }}
+                  onSelect={(entry, event) => selectEntry('local', entry, event)}
                   onEntryOpen={(entry) => void openEntry('local', entry)}
                   onRenameStart={() => startInlineRename('local')}
                   onRenameDraft={setRenameDraft}
@@ -1239,7 +1376,7 @@ function App() {
                   onRefresh={() => void refreshPane('local')}
                   transferActionLabel="Upload"
                   onTransfer={() => void queueSelectedUpload()}
-                  transferDisabled={!uploadCandidate() || localLoading() || remoteLoading()}
+                  transferDisabled={uploadCandidate().length === 0 || localLoading() || remoteLoading()}
                   onDelete={() => openDeleteConfirmation('local')}
                 />
               </div>
@@ -1265,7 +1402,7 @@ function App() {
                   active={activePane() === 'remote'}
                   paneClass={paneClass('remote')}
                   filterValue={remoteFilter()}
-                  selectedName={remoteSelection()}
+                  selectedNames={remoteSelection()}
                   loading={remoteLoading()}
                   errorMessage={remoteRuntimeError()}
                   editingName={renamingPane() === 'remote' ? renamingEntryName() : null}
@@ -1292,10 +1429,7 @@ function App() {
                   }}
                   onFilter={setRemoteFilter}
                   onFocus={() => activatePane('remote')}
-                  onSelect={(entry) => {
-                    setRemoteSelection(entry.name)
-                    activatePane('remote')
-                  }}
+                  onSelect={(entry, event) => selectEntry('remote', entry, event)}
                   onEntryOpen={(entry) => void openEntry('remote', entry)}
                   onRenameStart={() => startInlineRename('remote')}
                   onRenameDraft={setRenameDraft}
@@ -1309,7 +1443,7 @@ function App() {
                   onRefresh={() => void refreshPane('remote')}
                   transferActionLabel="Download"
                   onTransfer={() => void queueSelectedDownload()}
-                  transferDisabled={!downloadCandidate() || remoteLoading() || localLoading()}
+                  transferDisabled={downloadCandidate().length === 0 || remoteLoading() || localLoading()}
                   onDelete={() => openDeleteConfirmation('remote')}
                 />
               </div>
@@ -1323,7 +1457,7 @@ function App() {
                 <div>{transfers().jobs.length} jobs</div>
                 <button
                   class="warp-button px-2 py-1 text-[11px]"
-                  disabled={!transfers().jobs.some((job) => ['Succeeded', 'Failed', 'Cancelled'].includes(job.state))}
+                  disabled={!transfers().jobs.some((job) => ['Succeeded', 'Failed', 'Cancelled', 'CompletedWithErrors'].includes(job.state))}
                   onClick={() => void clearTransferHistory()}
                 >
                   Clear
@@ -1344,13 +1478,15 @@ function App() {
                   {(job) => (
                     <div class="border-b border-white/5 px-3 py-2 last:border-b-0">
                       <div class="flex items-center gap-3 text-left">
-                        <div class={`font-mono text-sm ${job.direction === 'Upload' ? 'text-zinc-400' : 'text-zinc-300'}`}>
+                        <div class={`font-mono text-sm ${job.direction === 'Upload' ? 'text-zinc-400' : 'text-zinc-300'} ${job.kind === 'child' ? 'opacity-60' : ''}`}>
                           {job.direction === 'Upload' ? '↑' : '↓'}
                         </div>
                         <div class="min-w-0 flex-1">
                           <div class="flex items-center gap-3 font-mono text-sm">
-                            <div class="truncate text-white">{job.name}</div>
-                            <Show when={!job.conflict && job.state !== 'Failed'}>
+                            <div class={`truncate ${job.kind === 'batch' ? 'text-white' : 'text-zinc-300'}`}>
+                              {job.kind === 'child' ? `- ${job.name}` : job.name}
+                            </div>
+                            <Show when={!job.conflict && !['Failed', 'CompletedWithErrors', 'PausedDisconnected'].includes(job.state)}>
                               <div class="shrink-0 text-zinc-500">
                                 {job.progressPercent === null ? '--' : `${job.progressPercent}%`}
                                 <span class="mx-2 text-zinc-700">/</span>
@@ -1360,31 +1496,64 @@ function App() {
                           </div>
                           <Show when={job.conflict}>
                             {(conflict) => (
-                              <div class="mt-1 flex flex-wrap items-center gap-2 font-mono text-xs text-amber-100">
-                                <span>
-                                  Conflict: destination exists as {conflict().destinationKind === 'dir' ? 'a directory' : 'a file'}.
-                                </span>
+                              <div class="mt-1 space-y-1 font-mono text-xs text-amber-100">
+                                <div class="truncate text-sm text-amber-50">
+                                  Conflict: {basename(conflict().sourceName || conflict().sourcePath)} -&gt; {basename(conflict().destinationName || conflict().destinationPath)}
+                                </div>
+                                <div class="truncate text-[11px] text-amber-100/70" title={`${conflict().sourcePath} -> ${conflict().destinationPath}`}>
+                                  {conflict().sourcePath} -&gt; {conflict().destinationPath}
+                                </div>
+                                <div class="text-[11px] text-amber-100/80">{transferConflictLabel(conflict())}</div>
+                                <Show when={conflict().applyToRemaining}>
+                                  <div class="text-[11px] text-amber-100/65">Applies to this item now. "All" actions affect future conflicts in this batch.</div>
+                                </Show>
+                                <div class="flex flex-wrap items-center gap-2">
                                 <Show when={conflict().canOverwrite}>
                                   <button class="warp-button px-2 py-1 text-[11px]" onClick={() => void resolveTransferJobConflict(job.id, 'overwrite')}>
                                     Overwrite
                                   </button>
+                                  <Show when={conflict().applyToRemaining}>
+                                    <button class="warp-button px-2 py-1 text-[11px]" onClick={() => void resolveTransferJobConflict(job.id, 'overwriteAll')}>
+                                      Overwrite All
+                                    </button>
+                                  </Show>
                                 </Show>
-                                <button class="warp-button px-2 py-1 text-[11px]" onClick={() => void resolveTransferJobConflict(job.id, 'cancel')}>
-                                  Cancel
+                                <button class="warp-button px-2 py-1 text-[11px]" onClick={() => void resolveTransferJobConflict(job.id, 'skip')}>
+                                  Skip
                                 </button>
+                                <Show when={conflict().applyToRemaining}>
+                                  <button class="warp-button px-2 py-1 text-[11px]" onClick={() => void resolveTransferJobConflict(job.id, 'skipAll')}>
+                                    Skip All
+                                  </button>
+                                </Show>
+                                <button class="warp-button px-2 py-1 text-[11px]" onClick={() => void resolveTransferJobConflict(job.id, 'cancelBatch')}>
+                                  Cancel Batch
+                                </button>
+                                </div>
                               </div>
                             )}
                           </Show>
-                          <Show when={!job.conflict && job.state === 'Failed' && job.errorMessage}>
-                            {(message) => <div class="mt-1 truncate font-mono text-xs text-red-200">{message()}</div>}
+                          <Show when={!job.conflict && job.errorMessage}>
+                            {(message) => <div class={`mt-1 truncate font-mono text-xs ${job.state === 'Failed' ? 'text-red-200' : 'text-zinc-400'}`}>{message()}</div>}
                           </Show>
-                          <Show when={!job.conflict && job.state !== 'Failed'}>
+                          <Show when={job.kind === 'batch' && summarizeTransfer(job)}>
+                            {(summary) => <div class="mt-1 truncate font-mono text-[11px] text-zinc-500">{summary()}</div>}
+                          </Show>
+                          <Show when={job.kind === 'batch' && job.currentItemLabel && !job.conflict}>
+                            {(label) => <div class="mt-1 truncate font-mono text-[11px] text-zinc-600">Active: {label()}</div>}
+                          </Show>
+                          <Show when={job.kind === 'child' || (!job.conflict && !job.errorMessage)}>
                             <div class="mt-1 truncate font-mono text-[11px] text-zinc-600" title={`${job.sourcePath} -> ${job.destinationPath}`}>
                               {job.destinationPath}
                             </div>
                           </Show>
                         </div>
                         <div class={`shrink-0 font-mono text-xs ${transferTone(job.state)}`}>{transferStateLabel(job.state)}</div>
+                        <Show when={job.canRetry}>
+                          <button class="warp-button shrink-0 px-2 py-1 text-[11px]" onClick={() => void retryTransferJob(job.id)}>
+                            Retry
+                          </button>
+                        </Show>
                         <button class="warp-button shrink-0 px-2 py-1 text-[11px]" disabled={!job.canCancel} onClick={() => void cancelTransferJob(job.id)}>
                           Cancel
                         </button>
@@ -1405,14 +1574,37 @@ function App() {
               class="w-full max-w-md rounded-xl border border-white/10 bg-[var(--warp-surface-elevated)] p-5 shadow-[0_30px_120px_rgba(0,0,0,0.55)]"
               onPointerDown={(event) => event.stopPropagation()}
             >
-              <div class="font-mono text-[11px] uppercase tracking-[0.24em] text-zinc-500">Delete Entry</div>
+              <div class="font-mono text-[11px] uppercase tracking-[0.24em] text-zinc-500">
+                {target().entries.length === 1 ? 'Delete Entry' : 'Delete Entries'}
+              </div>
               <div class="mt-3 font-mono text-sm text-zinc-300">
                 {target().message ?? 'This will permanently delete:'}
               </div>
               <div class="mt-3 rounded-md border border-red-400/20 bg-red-400/10 px-3 py-3 font-mono text-sm text-white">
-                {target().entry.name}
+                <Show
+                  when={target().entries.length === 1}
+                  fallback={
+                    <>
+                      {target().entries.length} selected entries
+                      <div class="mt-2 space-y-1 text-xs text-red-100/80">
+                        <For each={target().entries.slice(0, 5)}>
+                          {(entry) => <div class="truncate">{entry.name}</div>}
+                        </For>
+                        <Show when={target().entries.length > 5}>
+                          <div>...and {target().entries.length - 5} more</div>
+                        </Show>
+                      </div>
+                    </>
+                  }
+                >
+                  {target().entries[0].name}
+                </Show>
                 <div class="mt-1 text-[11px] uppercase tracking-[0.18em] text-red-100/70">
-                  {target().entry.kind === 'dir' ? 'Directory' : 'File'}
+                  {target().entries.length === 1
+                    ? target().entries[0].kind === 'dir'
+                      ? 'Directory'
+                      : 'File'
+                    : 'Multiple entries'}
                 </div>
               </div>
               <div class="mt-5 flex justify-end gap-2">
@@ -1443,7 +1635,7 @@ type PaneProps = {
   active: boolean
   paneClass: string
   filterValue: string
-  selectedName: string | null
+  selectedNames: string[]
   loading: boolean
   errorMessage: string | null
   editingName: string | null
@@ -1457,7 +1649,7 @@ type PaneProps = {
   setCreateDirectoryInputRef?: (element: HTMLInputElement) => void
   onFilter: (value: string) => void
   onFocus: () => void
-  onSelect: (entry: FileEntry) => void
+  onSelect: (entry: FileEntry, event: MouseEvent) => void
   onEntryOpen: (entry: FileEntry) => void
   onRenameStart?: () => void
   onRenameDraft?: (value: string) => void
@@ -1538,7 +1730,7 @@ function Pane(props: PaneProps) {
           </button>
           <button
             class="warp-button"
-            disabled={!props.onRenameStart || props.selectedCount === 0 || props.loading}
+            disabled={!props.onRenameStart || props.selectedCount !== 1 || props.loading}
             onClick={props.onRenameStart}
           >
             Rename
@@ -1611,13 +1803,13 @@ function Pane(props: PaneProps) {
           <div class="divide-y divide-white/5">
             <For each={props.entries}>
               {(entry) => {
-                const isSelected = () => props.selectedName === entry.name
+                const isSelected = () => props.selectedNames.includes(entry.name)
                 const isEditing = () => props.editingName === entry.name
 
                 return (
                   <div
                     class={`grid w-full grid-cols-[minmax(0,1.8fr)_110px_130px_90px] gap-3 px-4 py-3 text-left transition ${isSelected() ? 'bg-white/[0.08]' : 'hover:bg-white/[0.03]'}`}
-                    onPointerDown={() => props.onSelect(entry)}
+                    onPointerDown={(event) => props.onSelect(entry, event)}
                     onDblClick={() => props.onEntryOpen(entry)}
                   >
                     <div class="min-w-0 w-full">

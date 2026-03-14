@@ -21,6 +21,9 @@ export type PaneSnapshot = {
 
 export type TransferJob = {
   id: string
+  kind: 'batch' | 'child'
+  batchId: string | null
+  parentId: string | null
   protocol: 'SFTP' | 'SCP compatibility'
   direction: 'Upload' | 'Download'
   name: string
@@ -30,23 +33,54 @@ export type TransferJob = {
   bytesTotal: number | null
   bytesTransferred: number
   progressPercent: number | null
-  state: 'Queued' | 'Checking' | 'AwaitingConflictDecision' | 'Running' | 'Cancelling' | 'Cancelled' | 'Succeeded' | 'Failed'
+  state:
+    | 'Queued'
+    | 'Checking'
+    | 'AwaitingConflictDecision'
+    | 'Running'
+    | 'Cancelling'
+    | 'Cancelled'
+    | 'Succeeded'
+    | 'Failed'
+    | 'Skipped'
+    | 'CompletedWithErrors'
+    | 'PausedDisconnected'
   errorMessage: string | null
   conflict: TransferConflict | null
   canCancel: boolean
+  canRetry: boolean
+  summary: TransferJobSummary | null
+  currentItemLabel: string | null
 }
 
 export type TransferConflict = {
   destinationExists: boolean
   destinationKind: 'file' | 'dir' | 'symlink' | 'unknown'
+  sourceKind: 'file' | 'dir' | 'symlink' | 'unknown'
+  sourceName: string
+  sourcePath: string
+  destinationName: string
+  destinationPath: string
+  conflictKind: 'fileExists' | 'dirExists' | 'typeMismatch' | 'unknown'
   canOverwrite: boolean
+  applyToRemaining: boolean
+}
+
+export type TransferJobSummary = {
+  totalFiles: number
+  totalDirectories: number
+  completedFiles: number
+  failedFiles: number
+  skippedFiles: number
 }
 
 export type TransferQueueSnapshot = {
+  sequence: number
   jobs: TransferJob[]
   activeJobId: string | null
   queuedCount: number
   finishedCount: number
+  batchCount: number
 }
 
 export type SessionSnapshot = {
@@ -97,20 +131,29 @@ export type TrustDecision = {
 }
 
 export type QueueDownloadRequest = {
-  remotePath: string
-  remoteName: string
+  entries: TransferSelectionItem[]
   localDirectory: string
 }
 
 export type QueueUploadRequest = {
-  localPath: string
-  localName: string
+  entries: TransferSelectionItem[]
   remoteDirectory: string
+}
+
+export type TransferSelectionItem = {
+  path: string
+  name: string
+  kind: FileEntry['kind']
 }
 
 export type CreateRemoteDirectoryRequest = {
   parentPath: string
   name: string
+}
+
+export type DeleteLocalEntriesRequest = {
+  path: string
+  entryNames: string[]
 }
 
 export type RenameRemoteEntryRequest = {
@@ -126,12 +169,21 @@ export type DeleteRemoteEntryRequest = {
   recursive: boolean
 }
 
-export type RemoteDeletePrompt = {
-  path: string
-  name: string
+export type DeleteRemoteEntryTarget = {
+  entryName: string
   entryKind: FileEntry['kind']
+}
+
+export type DeleteRemoteEntriesRequest = {
+  parentPath: string
+  entries: DeleteRemoteEntryTarget[]
+  recursive: boolean
+}
+
+export type RemoteDeletePrompt = {
   message: string
   requiresRecursive: boolean
+  entries: DeleteRemoteEntryTarget[]
 }
 
 export type RemoteDeleteResponse = {
@@ -140,7 +192,7 @@ export type RemoteDeleteResponse = {
 }
 
 export type TransferConflictResolution = {
-  action: 'overwrite' | 'cancel'
+  action: 'overwrite' | 'skip' | 'overwriteAll' | 'skipAll' | 'cancelBatch'
 }
 
 export type AppBootstrap = {

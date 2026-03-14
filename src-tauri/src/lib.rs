@@ -17,6 +17,9 @@ mod store;
 mod transfer;
 mod trust;
 
+#[cfg(test)]
+mod validation_tests;
+
 pub fn run() {
     logging::init();
 
@@ -39,7 +42,7 @@ pub fn run() {
             app::open_local_directory,
             app::go_up_local_directory,
             app::rename_local_entry,
-            app::delete_local_entry,
+            app::delete_local_entries,
             app::connect_remote,
             app::resolve_remote_trust,
             app::disconnect_remote,
@@ -49,10 +52,12 @@ pub fn run() {
             app::create_remote_directory,
             app::rename_remote_entry,
             app::delete_remote_entry,
+            app::delete_remote_entries,
             app::queue_download,
             app::queue_upload,
             app::list_transfer_jobs,
             app::cancel_transfer,
+            app::retry_transfer,
             app::resolve_transfer_conflict,
             app::clear_completed_transfers
         ])

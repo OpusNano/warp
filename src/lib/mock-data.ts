@@ -44,10 +44,12 @@ export const mockBootstrap: AppBootstrap = {
     },
   },
   transfers: {
+    sequence: 0,
     jobs: [],
     activeJobId: null,
     queuedCount: 0,
     finishedCount: 0,
+    batchCount: 0,
   },
   shortcuts: ['Tab pane', 'Ctrl+1 local', 'Ctrl+2 remote', 'Ctrl+F filter', 'F5 refresh'],
 }
