@@ -16,6 +16,7 @@ export type PaneSnapshot = {
   itemCount: number
   canGoUp: boolean
   entries: FileEntry[]
+  emptyMessage: string | null
 }
 
 export type TransferJob = {
@@ -35,12 +36,45 @@ export type SessionSnapshot = {
   host: string
   authMethod: string
   trustState: string
+  lastError: string | null
+  canDisconnect: boolean
 }
 
 export type ConnectionProfile = {
   name: string
   target: string
   auth: string
+}
+
+export type TrustPrompt = {
+  host: string
+  port: number
+  keyAlgorithm: string
+  fingerprintSha256: string
+  status: 'firstSeen' | 'mismatch'
+  message: string
+  expectedFingerprintSha256: string | null
+}
+
+export type RemoteConnectionSnapshot = {
+  session: SessionSnapshot
+  remotePane: PaneSnapshot
+  trustPrompt: TrustPrompt | null
+}
+
+export type ConnectAuth =
+  | { kind: 'password'; password: string }
+  | { kind: 'key'; privateKeyPath: string; passphrase: string | null }
+
+export type ConnectRequest = {
+  host: string
+  port: number
+  username: string
+  auth: ConnectAuth
+}
+
+export type TrustDecision = {
+  trust: boolean
 }
 
 export type AppBootstrap = {

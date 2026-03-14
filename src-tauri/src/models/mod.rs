@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -26,6 +26,8 @@ pub struct SessionSnapshot {
     pub host: String,
     pub auth_method: String,
     pub trust_state: String,
+    pub last_error: Option<String>,
+    pub can_disconnect: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -43,6 +45,7 @@ pub struct PaneSnapshot {
     pub item_count: usize,
     pub can_go_up: bool,
     pub entries: Vec<FileEntry>,
+    pub empty_message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -69,73 +72,64 @@ pub struct TransferJob {
     pub state: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrustPrompt {
+    pub host: String,
+    pub port: u16,
+    pub key_algorithm: String,
+    pub fingerprint_sha256: String,
+    pub status: String,
+    pub message: String,
+    pub expected_fingerprint_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteConnectionSnapshot {
+    pub session: SessionSnapshot,
+    pub remote_pane: PaneSnapshot,
+    pub trust_prompt: Option<TrustPrompt>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectRequest {
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub auth: ConnectAuth,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ConnectAuth {
+    Password {
+        password: String,
+    },
+    Key {
+        #[serde(rename = "privateKeyPath")]
+        private_key_path: String,
+        passphrase: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrustDecision {
+    pub trust: bool,
+}
+
 impl AppBootstrap {
-    pub fn remote_mock() -> PaneSnapshot {
+    pub fn remote_placeholder() -> PaneSnapshot {
         PaneSnapshot {
             id: "remote".into(),
             title: "Remote".into(),
-            location: "/srv/www/releases/current".into(),
-            item_count: 9,
-            can_go_up: true,
-            entries: vec![
-                FileEntry::dir(
-                    "/srv/www/releases/current/assets",
-                    "assets",
-                    Some(1_760_000_000_000),
-                    "drwxr-xr-x",
-                ),
-                FileEntry::dir(
-                    "/srv/www/releases/current/config",
-                    "config",
-                    Some(1_760_000_100_000),
-                    "drwxr-x---",
-                ),
-                FileEntry::dir(
-                    "/srv/www/releases/current/public",
-                    "public",
-                    Some(1_760_000_200_000),
-                    "drwxr-xr-x",
-                ),
-                FileEntry::dir(
-                    "/srv/www/releases/current/storage",
-                    "storage",
-                    Some(1_760_000_300_000),
-                    "drwxrwx---",
-                ),
-                FileEntry::dir(
-                    "/srv/www/releases/current/vendor",
-                    "vendor",
-                    Some(1_760_000_400_000),
-                    "drwxr-xr-x",
-                ),
-                FileEntry::file(
-                    "/srv/www/releases/current/.env.production",
-                    ".env.production",
-                    Some(1_434),
-                    Some(1_760_000_500_000),
-                    "-rw-------",
-                ),
-                FileEntry::file(
-                    "/srv/www/releases/current/index.php",
-                    "index.php",
-                    Some(1_843),
-                    Some(1_760_000_600_000),
-                    "-rw-r--r--",
-                ),
-                FileEntry::file(
-                    "/srv/www/releases/current/release.json",
-                    "release.json",
-                    Some(732),
-                    Some(1_760_000_700_000),
-                    "-rw-r--r--",
-                ),
-                FileEntry::symlink(
-                    "/srv/www/releases/current/var",
-                    "var",
-                    Some(1_760_000_800_000),
-                    "lrwxrwxrwx",
-                ),
-            ],
+            location: "Not connected".into(),
+            item_count: 0,
+            can_go_up: false,
+            entries: Vec::new(),
+            empty_message: Some("Connect to a host to browse remote files.".into()),
         }
     }
 
@@ -144,8 +138,10 @@ impl AppBootstrap {
             connection_state: "Disconnected".into(),
             protocol_mode: "SFTP primary".into(),
             host: "No active session".into(),
-            auth_method: "SSH key".into(),
+            auth_method: "None".into(),
             trust_state: "No host selected".into(),
+            last_error: None,
+            can_disconnect: false,
         }
     }
 
@@ -172,6 +168,16 @@ impl AppBootstrap {
             "Ctrl+F filter".into(),
             "F5 refresh".into(),
         ]
+    }
+}
+
+impl RemoteConnectionSnapshot {
+    pub fn disconnected(session: SessionSnapshot) -> Self {
+        Self {
+            session,
+            remote_pane: AppBootstrap::remote_placeholder(),
+            trust_prompt: None,
+        }
     }
 }
 

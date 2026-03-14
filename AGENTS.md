@@ -31,6 +31,7 @@ Repo-specific guidance for contributors and coding agents working on `warp`.
 - Do not wire buttons or backend functionality unless the task requires it.
 - Prefer focused changes over broad refactors.
 - Do not add new abstractions without a concrete need.
+- The current remote slice covers connection, trust verification, authentication, and remote browsing only; do not imply remote file mutation or transfers work unless a task explicitly implements them.
 
 ## Validation
 

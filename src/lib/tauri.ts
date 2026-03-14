@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core'
 import { mockBootstrap } from './mock-data'
-import type { AppBootstrap, PaneSnapshot } from './types'
+import type { AppBootstrap, ConnectRequest, PaneSnapshot, RemoteConnectionSnapshot, TrustDecision } from './types'
 
 declare global {
   interface Window {
@@ -58,4 +58,76 @@ export async function deleteLocalEntry(path: string, entryName: string): Promise
   }
 
   return invoke<PaneSnapshot>('delete_local_entry', { path, entryName })
+}
+
+export async function connectRemote(request: ConnectRequest): Promise<RemoteConnectionSnapshot> {
+  if (!window.__TAURI_INTERNALS__) {
+    return {
+      session: mockBootstrap.session,
+      remotePane: mockBootstrap.panes.remote,
+      trustPrompt: null,
+    }
+  }
+
+  return invoke<RemoteConnectionSnapshot>('connect_remote', { request })
+}
+
+export async function resolveRemoteTrust(decision: TrustDecision): Promise<RemoteConnectionSnapshot> {
+  if (!window.__TAURI_INTERNALS__) {
+    return {
+      session: mockBootstrap.session,
+      remotePane: mockBootstrap.panes.remote,
+      trustPrompt: null,
+    }
+  }
+
+  return invoke<RemoteConnectionSnapshot>('resolve_remote_trust', { decision })
+}
+
+export async function disconnectRemote(): Promise<RemoteConnectionSnapshot> {
+  if (!window.__TAURI_INTERNALS__) {
+    return {
+      session: mockBootstrap.session,
+      remotePane: mockBootstrap.panes.remote,
+      trustPrompt: null,
+    }
+  }
+
+  return invoke<RemoteConnectionSnapshot>('disconnect_remote')
+}
+
+export async function refreshRemoteDirectory(): Promise<RemoteConnectionSnapshot> {
+  if (!window.__TAURI_INTERNALS__) {
+    return {
+      session: mockBootstrap.session,
+      remotePane: mockBootstrap.panes.remote,
+      trustPrompt: null,
+    }
+  }
+
+  return invoke<RemoteConnectionSnapshot>('refresh_remote_directory')
+}
+
+export async function openRemoteDirectory(path: string): Promise<RemoteConnectionSnapshot> {
+  if (!window.__TAURI_INTERNALS__) {
+    return {
+      session: mockBootstrap.session,
+      remotePane: mockBootstrap.panes.remote,
+      trustPrompt: null,
+    }
+  }
+
+  return invoke<RemoteConnectionSnapshot>('open_remote_directory', { path })
+}
+
+export async function goUpRemoteDirectory(): Promise<RemoteConnectionSnapshot> {
+  if (!window.__TAURI_INTERNALS__) {
+    return {
+      session: mockBootstrap.session,
+      remotePane: mockBootstrap.panes.remote,
+      trustPrompt: null,
+    }
+  }
+
+  return invoke<RemoteConnectionSnapshot>('go_up_remote_directory')
 }

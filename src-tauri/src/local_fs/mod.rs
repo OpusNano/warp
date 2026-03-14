@@ -132,6 +132,7 @@ impl LocalFilesystem {
             item_count: entries.len(),
             can_go_up: path.parent().is_some(),
             entries,
+            empty_message: Some("Local directory is empty.".into()),
         })
     }
 

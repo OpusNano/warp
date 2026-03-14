@@ -1,13 +1,28 @@
 import { For, Show, createMemo, createSignal, onCleanup, onMount } from 'solid-js'
 import {
   bootstrapAppState,
+  connectRemote,
   deleteLocalEntry,
+  disconnectRemote,
   goUpLocalDirectory,
+  goUpRemoteDirectory,
   listLocalDirectory,
   openLocalDirectory,
+  openRemoteDirectory,
+  refreshRemoteDirectory,
   renameLocalEntry,
+  resolveRemoteTrust,
 } from './lib/tauri'
-import type { AppBootstrap, FileEntry, PaneId, PaneSnapshot, TransferJob } from './lib/types'
+import type {
+  AppBootstrap,
+  ConnectRequest,
+  FileEntry,
+  PaneId,
+  PaneSnapshot,
+  RemoteConnectionSnapshot,
+  TransferJob,
+  TrustPrompt,
+} from './lib/types'
 
 const defaultState: AppBootstrap = {
   connectionProfiles: [],
@@ -15,8 +30,10 @@ const defaultState: AppBootstrap = {
     connectionState: 'Disconnected',
     protocolMode: 'SFTP primary',
     host: 'No active session',
-    authMethod: 'SSH key',
+    authMethod: 'None',
     trustState: 'No host selected',
+    lastError: null,
+    canDisconnect: false,
   },
   panes: {
     local: {
@@ -26,14 +43,16 @@ const defaultState: AppBootstrap = {
       itemCount: 0,
       canGoUp: true,
       entries: [],
+      emptyMessage: 'Local directory is empty.',
     },
     remote: {
       id: 'remote',
       title: 'Remote',
-      location: '/srv',
+      location: 'Not connected',
       itemCount: 0,
-      canGoUp: true,
+      canGoUp: false,
       entries: [],
+      emptyMessage: 'Connect to a host to browse remote files.',
     },
   },
   transfers: [],
@@ -112,11 +131,22 @@ function renameSelectionRange(entry: FileEntry) {
   return [0, extensionIndex] as const
 }
 
+function remotePlaceholder(emptyMessage: string): PaneSnapshot {
+  return {
+    id: 'remote',
+    title: 'Remote',
+    location: 'Not connected',
+    itemCount: 0,
+    canGoUp: false,
+    entries: [],
+    emptyMessage,
+  }
+}
+
 function App() {
   const [session, setSession] = createSignal(defaultState.session)
   const [localPane, setLocalPane] = createSignal(defaultState.panes.local)
   const [remotePane, setRemotePane] = createSignal(defaultState.panes.remote)
-  const [remoteMock, setRemoteMock] = createSignal(defaultState.panes.remote)
   const [transfers, setTransfers] = createSignal(defaultState.transfers)
   const [shortcuts, setShortcuts] = createSignal(defaultState.shortcuts)
   const [activePane, setActivePane] = createSignal<PaneId>('local')
@@ -127,10 +157,21 @@ function App() {
   const [localSelection, setLocalSelection] = createSignal<string | null>(null)
   const [remoteSelection, setRemoteSelection] = createSignal<string | null>(null)
   const [localLoading, setLocalLoading] = createSignal(false)
+  const [remoteLoading, setRemoteLoading] = createSignal(false)
   const [localError, setLocalError] = createSignal<string | null>(null)
+  const [connectError, setConnectError] = createSignal<string | null>(null)
+  const [remoteRuntimeError, setRemoteRuntimeError] = createSignal<string | null>(null)
+  const [trustPrompt, setTrustPrompt] = createSignal<TrustPrompt | null>(null)
   const [renamingEntryName, setRenamingEntryName] = createSignal<string | null>(null)
   const [renameDraft, setRenameDraft] = createSignal('')
   const [pendingDeleteEntry, setPendingDeleteEntry] = createSignal<FileEntry | null>(null)
+  const [connectHost, setConnectHost] = createSignal('')
+  const [connectPort, setConnectPort] = createSignal('22')
+  const [connectUsername, setConnectUsername] = createSignal('')
+  const [connectAuthMode, setConnectAuthMode] = createSignal<'password' | 'key'>('password')
+  const [connectPassword, setConnectPassword] = createSignal('')
+  const [connectPrivateKeyPath, setConnectPrivateKeyPath] = createSignal('')
+  const [connectPassphrase, setConnectPassphrase] = createSignal('')
 
   let localPaneElement: HTMLElement | undefined
   let remotePaneElement: HTMLElement | undefined
@@ -144,18 +185,155 @@ function App() {
     return localPane().entries.find((entry) => entry.name === selection) ?? null
   })
 
+  const clearRemoteTransientState = (emptyMessage: string) => {
+    setRemotePane(remotePlaceholder(emptyMessage))
+    setRemoteSelection(null)
+  }
+
+  const setTransientRemoteSession = (connectionState: string, trustState: string, hostOverride?: string) => {
+    const request = buildConnectRequest()
+    const authMethod = request.auth.kind === 'password' ? 'Password' : 'SSH key'
+    const host = hostOverride ?? (request.host && request.username ? `${request.username}@${request.host}:${request.port}` : session().host)
+
+    setSession({
+      ...session(),
+      connectionState,
+      protocolMode: 'SFTP primary',
+      host,
+      authMethod,
+      trustState,
+      lastError: null,
+      canDisconnect: false,
+    })
+  }
+
   onMount(async () => {
     const state = await bootstrapAppState()
 
     setSession(state.session)
     setLocalPane(state.panes.local)
     setRemotePane(state.panes.remote)
-    setRemoteMock(state.panes.remote)
     setTransfers(state.transfers)
     setShortcuts(state.shortcuts)
     syncSelection('local', state.panes.local, null)
     syncSelection('remote', state.panes.remote, null)
   })
+
+  const applyRemoteSnapshot = (snapshot: RemoteConnectionSnapshot, preferredName: string | null = null) => {
+    setSession(snapshot.session)
+    setRemotePane(snapshot.remotePane)
+    setTrustPrompt(snapshot.trustPrompt)
+    const isRuntimeError = snapshot.remotePane.location !== 'Not connected' || snapshot.remotePane.entries.length > 0
+    setConnectError(isRuntimeError ? null : snapshot.session.lastError)
+    setRemoteRuntimeError(isRuntimeError ? snapshot.session.lastError : null)
+    syncSelection('remote', snapshot.remotePane, preferredName)
+  }
+
+  const buildConnectRequest = (): ConnectRequest => ({
+    host: connectHost().trim(),
+    port: Number.parseInt(connectPort().trim(), 10) || 22,
+    username: connectUsername().trim(),
+    auth:
+      connectAuthMode() === 'password'
+        ? { kind: 'password', password: connectPassword() }
+        : {
+            kind: 'key',
+            privateKeyPath: connectPrivateKeyPath().trim(),
+            passphrase: connectPassphrase().trim() || null,
+          },
+  })
+
+  const showRemoteValidationError = (message: string) => {
+    setConnectError(message)
+    setRemoteRuntimeError(null)
+    setSession({ ...session(), lastError: message })
+  }
+
+  const submitConnect = async () => {
+    const request = buildConnectRequest()
+
+    if (!request.host || !request.username) {
+      showRemoteValidationError('Host and username are required.')
+      return
+    }
+
+    if (!Number.isInteger(request.port) || request.port < 1 || request.port > 65535) {
+      showRemoteValidationError('Port must be between 1 and 65535.')
+      return
+    }
+
+    if (request.auth.kind === 'key' && request.auth.privateKeyPath.length === 0) {
+      showRemoteValidationError('Private key path is required for SSH key authentication.')
+      return
+    }
+
+    setRemoteLoading(true)
+    setConnectError(null)
+    setRemoteRuntimeError(null)
+    setTrustPrompt(null)
+    clearRemoteTransientState('Connecting to remote host...')
+    setTransientRemoteSession('Connecting', 'Verifying host key')
+
+    try {
+      const snapshot = await connectRemote(request)
+      applyRemoteSnapshot(snapshot)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to connect to remote host.'
+      setConnectError(message)
+      setSession({ ...session(), lastError: message })
+    } finally {
+      setRemoteLoading(false)
+    }
+  }
+
+  const submitDisconnect = async () => {
+    setRemoteLoading(true)
+    setConnectError(null)
+    setRemoteRuntimeError(null)
+    setTrustPrompt(null)
+    clearRemoteTransientState('Disconnecting remote session...')
+    setSession({
+      ...session(),
+      connectionState: 'Disconnecting',
+      trustState: 'Clearing session',
+      lastError: null,
+      canDisconnect: false,
+    })
+
+    try {
+      const snapshot = await disconnectRemote()
+      applyRemoteSnapshot(snapshot, null)
+      setRemoteSelection(null)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to disconnect remote session.'
+      setConnectError(message)
+      setSession({ ...session(), lastError: message })
+    } finally {
+      setRemoteLoading(false)
+    }
+  }
+
+  const handleTrustDecision = async (trust: boolean) => {
+    setRemoteLoading(true)
+    setConnectError(null)
+    setRemoteRuntimeError(null)
+
+    if (trust) {
+      clearRemoteTransientState('Authenticating with remote host...')
+      setTransientRemoteSession('Authenticating', 'Trust accepted')
+    }
+
+    try {
+      const snapshot = await resolveRemoteTrust({ trust })
+      applyRemoteSnapshot(snapshot)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to resolve trust decision.'
+      setConnectError(message)
+      setSession({ ...session(), lastError: message })
+    } finally {
+      setRemoteLoading(false)
+    }
+  }
 
   const resize = (clientX: number) => {
     const root = document.getElementById('workspace-shell')
@@ -279,45 +457,101 @@ function App() {
       return
     }
 
-    setPaneSnapshot('remote', remoteMock(), remoteSelection())
+    setRemoteLoading(true)
+    setRemoteRuntimeError(null)
+    setConnectError(null)
+    setSession({ ...session(), connectionState: 'Refreshing', lastError: null })
+
+    try {
+      const snapshot = await refreshRemoteDirectory()
+      applyRemoteSnapshot(snapshot, remoteSelection())
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to refresh remote directory.'
+      setRemoteRuntimeError(message)
+      setSession({ ...session(), lastError: null })
+    } finally {
+      setRemoteLoading(false)
+    }
   }
 
   const openEntry = async (paneId: PaneId, entry: FileEntry) => {
     setSelectionForPane(paneId, entry.name)
     activatePane(paneId)
 
-    if (paneId !== 'local' || entry.kind !== 'dir') return
+    if (entry.kind !== 'dir') return
 
-    setLocalLoading(true)
-    setLocalError(null)
-    clearLocalTransientUi()
+    if (paneId === 'local') {
+      setLocalLoading(true)
+      setLocalError(null)
+      clearLocalTransientUi()
+
+      try {
+        const nextPane = await openLocalDirectory(localPane().location, entry.name)
+        setPaneSnapshot('local', nextPane, null)
+      } catch (error) {
+        setLocalError(error instanceof Error ? error.message : 'Failed to open directory.')
+      } finally {
+        setLocalLoading(false)
+      }
+
+      return
+    }
+
+    setRemoteLoading(true)
+    setRemoteRuntimeError(null)
+    setConnectError(null)
+    setSession({ ...session(), connectionState: 'Opening directory', lastError: null })
 
     try {
-      const nextPane = await openLocalDirectory(localPane().location, entry.name)
-      setPaneSnapshot('local', nextPane, null)
+      const snapshot = await openRemoteDirectory(entry.path)
+      applyRemoteSnapshot(snapshot, null)
     } catch (error) {
-      setLocalError(error instanceof Error ? error.message : 'Failed to open directory.')
+      const message = error instanceof Error ? error.message : 'Failed to open remote directory.'
+      setRemoteRuntimeError(message)
+      setSession({ ...session(), lastError: null })
     } finally {
-      setLocalLoading(false)
+      setRemoteLoading(false)
     }
   }
 
   const goUpInPane = async (paneId: PaneId) => {
-    if (paneId !== 'local' || !localPane().canGoUp) return
+    if (paneId === 'local') {
+      if (!localPane().canGoUp) return
 
-    const currentName = localPane().location.split('/').filter(Boolean).at(-1) ?? null
+      const currentName = localPane().location.split('/').filter(Boolean).at(-1) ?? null
 
-    setLocalLoading(true)
-    setLocalError(null)
-    clearLocalTransientUi()
+      setLocalLoading(true)
+      setLocalError(null)
+      clearLocalTransientUi()
+
+      try {
+        const nextPane = await goUpLocalDirectory(localPane().location)
+        setPaneSnapshot('local', nextPane, currentName)
+      } catch (error) {
+        setLocalError(error instanceof Error ? error.message : 'Failed to navigate to parent directory.')
+      } finally {
+        setLocalLoading(false)
+      }
+
+      return
+    }
+
+    if (!remotePane().canGoUp) return
+
+    setRemoteLoading(true)
+    setRemoteRuntimeError(null)
+    setConnectError(null)
+    setSession({ ...session(), connectionState: 'Opening directory', lastError: null })
 
     try {
-      const nextPane = await goUpLocalDirectory(localPane().location)
-      setPaneSnapshot('local', nextPane, currentName)
+      const snapshot = await goUpRemoteDirectory()
+      applyRemoteSnapshot(snapshot, null)
     } catch (error) {
-      setLocalError(error instanceof Error ? error.message : 'Failed to navigate to parent directory.')
+      const message = error instanceof Error ? error.message : 'Failed to navigate to parent remote directory.'
+      setRemoteRuntimeError(message)
+      setSession({ ...session(), lastError: null })
     } finally {
-      setLocalLoading(false)
+      setRemoteLoading(false)
     }
   }
 
@@ -534,21 +768,103 @@ function App() {
             </div>
           </div>
 
-          <div class="mt-4 flex flex-col gap-3 border-t border-white/10 pt-4 lg:flex-row lg:items-center lg:justify-between">
-            <div class="flex flex-wrap gap-2">
-              <button class="warp-button warp-button-primary" disabled>
-                Quick Connect
-              </button>
-              <button class="warp-button" disabled>
-                Saved Connections
-              </button>
-              <button class="warp-button" onClick={() => void refreshPane(activePane())}>
-                Refresh Active Pane
-              </button>
-              <button class="warp-button" disabled>
-                New Directory
-              </button>
+          <Show when={connectError()}>
+            {(message) => <div class="mt-4 rounded-md border border-red-400/20 bg-red-400/10 px-3 py-2 font-mono text-xs text-red-200">{message()}</div>}
+          </Show>
+
+          <div class="mt-4 flex flex-col gap-4 border-t border-white/10 pt-4">
+            <div class="rounded-lg border border-white/10 bg-black/35 px-4 py-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]">
+              <div class="grid gap-3 lg:grid-cols-[minmax(220px,1.5fr)_80px_minmax(140px,0.9fr)_110px_auto] lg:items-end">
+                <label class="block">
+                  <span class="mb-2 block font-mono text-[10px] uppercase tracking-[0.2em] text-zinc-500">Host</span>
+                  <input value={connectHost()} onInput={(event) => setConnectHost(event.currentTarget.value)} placeholder="example.com" class="w-full rounded-md border border-white/12 bg-black/60 px-3 py-2 font-mono text-sm text-white outline-none transition placeholder:text-zinc-600 focus:border-white/35" />
+                </label>
+                <label class="block">
+                  <span class="mb-2 block font-mono text-[10px] uppercase tracking-[0.2em] text-zinc-500">Port</span>
+                  <input value={connectPort()} onInput={(event) => setConnectPort(event.currentTarget.value)} inputmode="numeric" placeholder="22" class="w-full rounded-md border border-white/12 bg-black/60 px-3 py-2 font-mono text-sm text-white outline-none transition placeholder:text-zinc-600 focus:border-white/35" />
+                </label>
+                <label class="block">
+                  <span class="mb-2 block font-mono text-[10px] uppercase tracking-[0.2em] text-zinc-500">User</span>
+                  <input value={connectUsername()} onInput={(event) => setConnectUsername(event.currentTarget.value)} placeholder="username" class="w-full rounded-md border border-white/12 bg-black/60 px-3 py-2 font-mono text-sm text-white outline-none transition placeholder:text-zinc-600 focus:border-white/35" />
+                </label>
+                <label class="block">
+                  <span class="mb-2 block font-mono text-[10px] uppercase tracking-[0.2em] text-zinc-500">Auth</span>
+                  <select value={connectAuthMode()} onChange={(event) => setConnectAuthMode(event.currentTarget.value === 'key' ? 'key' : 'password')} class="w-full appearance-none rounded-md border border-white/12 bg-black/60 px-3 py-2 font-mono text-sm text-white outline-none transition focus:border-white/35">
+                    <option value="password">Password</option>
+                    <option value="key">SSH key</option>
+                  </select>
+                </label>
+
+                <div class="flex flex-wrap gap-2 lg:justify-end">
+                  <button class="warp-button" onClick={() => void refreshPane(activePane())} disabled={localLoading() || remoteLoading()}>
+                    Refresh Active Pane
+                  </button>
+                  <button class="warp-button warp-button-primary" onClick={() => void submitConnect()} disabled={remoteLoading()}>
+                    {session().canDisconnect ? 'Reconnect' : 'Connect'}
+                  </button>
+                  <button class="warp-button" onClick={() => void submitDisconnect()} disabled={!session().canDisconnect || remoteLoading()}>
+                    Disconnect
+                  </button>
+                </div>
+              </div>
+
+              <Show
+                when={connectAuthMode() === 'password'}
+                fallback={
+                  <div class="mt-3 grid gap-3 lg:grid-cols-[minmax(0,1fr)_minmax(220px,320px)] lg:items-end">
+                    <label class="block">
+                      <span class="mb-2 block font-mono text-[10px] uppercase tracking-[0.2em] text-zinc-500">Private Key</span>
+                      <input value={connectPrivateKeyPath()} onInput={(event) => setConnectPrivateKeyPath(event.currentTarget.value)} placeholder="/home/user/.ssh/id_ed25519" class="w-full rounded-md border border-white/12 bg-black/60 px-3 py-2 font-mono text-sm text-white outline-none transition placeholder:text-zinc-600 focus:border-white/35" />
+                    </label>
+                    <label class="block">
+                      <span class="mb-2 block font-mono text-[10px] uppercase tracking-[0.2em] text-zinc-500">Passphrase</span>
+                      <input type="password" value={connectPassphrase()} onInput={(event) => setConnectPassphrase(event.currentTarget.value)} placeholder="optional" class="w-full rounded-md border border-white/12 bg-black/60 px-3 py-2 font-mono text-sm text-white outline-none transition placeholder:text-zinc-600 focus:border-white/35" />
+                    </label>
+                  </div>
+                }
+              >
+                <div class="mt-3 grid gap-3 lg:grid-cols-[minmax(260px,420px)] lg:items-end">
+                  <label class="block">
+                    <span class="mb-2 block font-mono text-[10px] uppercase tracking-[0.2em] text-zinc-500">Password</span>
+                    <input type="password" value={connectPassword()} onInput={(event) => setConnectPassword(event.currentTarget.value)} placeholder="optional" class="w-full rounded-md border border-white/12 bg-black/60 px-3 py-2 font-mono text-sm text-white outline-none transition placeholder:text-zinc-600 focus:border-white/35" />
+                  </label>
+                </div>
+              </Show>
             </div>
+
+            <Show when={trustPrompt()}>
+              {(prompt) => (
+                <div class="rounded-lg border border-amber-300/20 bg-amber-200/10 px-4 py-3 font-mono text-sm text-amber-50">
+                  <div class="text-[10px] uppercase tracking-[0.22em] text-amber-200/70">Trust Required</div>
+                  <div class="mt-2">{prompt().message}</div>
+                  <div class="mt-3 grid grid-cols-[88px_minmax(0,1fr)] gap-x-3 gap-y-2 text-xs text-amber-100/80">
+                    <div class="text-amber-200/70">Host</div>
+                    <div>{prompt().host}:{prompt().port}</div>
+                    <div class="text-amber-200/70">Fingerprint</div>
+                    <div class="break-all">{prompt().fingerprintSha256}</div>
+                    <div class="text-amber-200/70">Algorithm</div>
+                    <div>{prompt().keyAlgorithm}</div>
+                    <Show when={prompt().expectedFingerprintSha256}>
+                      {(fingerprint) => (
+                        <>
+                          <div class="text-amber-200/70">Expected</div>
+                          <div class="break-all">{fingerprint()}</div>
+                        </>
+                      )}
+                    </Show>
+                  </div>
+                  <div class="mt-4 flex flex-wrap gap-2">
+                    <button class="warp-button" onClick={() => void handleTrustDecision(false)} disabled={remoteLoading()}>
+                      Cancel
+                    </button>
+                    <button class="warp-button warp-button-primary" onClick={() => void handleTrustDecision(true)} disabled={remoteLoading() || prompt().status !== 'firstSeen'}>
+                      Trust And Connect
+                    </button>
+                  </div>
+                </div>
+              )}
+            </Show>
+
             <div class="flex flex-wrap gap-2 font-mono text-[11px] uppercase tracking-[0.22em] text-zinc-500">
               <For each={shortcuts()}>
                 {(shortcut) => <span class="rounded-full border border-white/10 px-2 py-1">{shortcut}</span>}
@@ -626,8 +942,8 @@ function App() {
                   paneClass={paneClass('remote')}
                   filterValue={remoteFilter()}
                   selectedName={remoteSelection()}
-                  loading={false}
-                  errorMessage={null}
+                  loading={remoteLoading()}
+                  errorMessage={remoteRuntimeError()}
                   editingName={null}
                   renameDraft=""
                   selectedCount={selectedCount('remote')}
@@ -643,11 +959,8 @@ function App() {
                     setRemoteSelection(entry.name)
                     activatePane('remote')
                   }}
-                  onEntryOpen={(entry) => {
-                    setRemoteSelection(entry.name)
-                    activatePane('remote')
-                  }}
-                  onUp={undefined}
+                  onEntryOpen={(entry) => void openEntry('remote', entry)}
+                  onUp={() => void goUpInPane('remote')}
                   onRefresh={() => void refreshPane('remote')}
                   onDelete={undefined}
                 />
@@ -761,6 +1074,30 @@ type PaneProps = {
 
 function Pane(props: PaneProps) {
   const filteredCount = () => props.entries.length
+  const paneStatus = () => {
+    if (props.loading) return 'Loading'
+    if (props.errorMessage) return 'Error'
+    return props.active ? 'Focused' : 'Idle'
+  }
+
+  const paneStatusClass = () => {
+    if (props.loading) return 'border-white/20 text-white'
+    if (props.errorMessage) return 'border-red-300/30 text-red-200'
+    return 'border-white/10 text-zinc-400'
+  }
+
+  const emptyStateClass = () => {
+    if (props.errorMessage && !props.loading) return 'text-red-200'
+    if (props.loading) return 'text-white'
+    return 'text-zinc-500'
+  }
+
+  const emptyStateMessage = () => {
+    if (props.loading) return 'Loading directory...'
+    if (props.errorMessage && props.pane.entries.length === 0) return props.errorMessage
+    if (props.filterValue.trim().length > 0) return 'No entries match the current filter.'
+    return props.pane.emptyMessage ?? 'Directory is empty.'
+  }
 
   return (
     <section
@@ -776,8 +1113,8 @@ function Pane(props: PaneProps) {
             <div class="font-mono text-[11px] uppercase tracking-[0.24em] text-zinc-500">{props.pane.title}</div>
             <div class="mt-1 truncate font-mono text-sm text-white">{props.pane.location}</div>
           </div>
-          <div class="rounded-full border border-white/10 px-2 py-1 font-mono text-[10px] uppercase tracking-[0.18em] text-zinc-400">
-            {props.active ? 'Focused' : 'Idle'}
+          <div class={`rounded-full border px-2 py-1 font-mono text-[10px] uppercase tracking-[0.18em] ${paneStatusClass()}`}>
+            {paneStatus()}
           </div>
         </div>
 
@@ -825,12 +1162,12 @@ function Pane(props: PaneProps) {
         <div>Perms</div>
       </div>
 
-      <div class="min-h-0 flex-1 overflow-auto">
+      <div class="relative min-h-0 flex-1 overflow-auto">
         <Show
           when={props.entries.length > 0}
           fallback={
-            <div class="flex h-full items-center justify-center px-6 text-center font-mono text-sm text-zinc-500">
-              {props.loading ? 'Loading directory...' : 'No entries match the current filter.'}
+            <div class={`flex h-full items-center justify-center px-6 text-center font-mono text-sm ${emptyStateClass()}`}>
+              {emptyStateMessage()}
             </div>
           }
         >
@@ -887,6 +1224,12 @@ function Pane(props: PaneProps) {
                 )
               }}
             </For>
+          </div>
+        </Show>
+
+        <Show when={props.loading && props.entries.length > 0}>
+          <div class="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/50 px-6 text-center font-mono text-sm text-white backdrop-blur-[1px]">
+            Loading directory...
           </div>
         </Show>
       </div>
