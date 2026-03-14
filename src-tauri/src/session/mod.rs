@@ -980,7 +980,9 @@ fn classify_remote_failure(error: SftpError) -> RemoteFailure {
             StatusCode::Failure => {
                 let message = status.error_message.trim();
                 if message.eq_ignore_ascii_case("failure") || message.is_empty() {
-                    RemoteFailure::Other("The server could not complete that remote filesystem operation.".into())
+                    RemoteFailure::Other(
+                        "The server reported a generic SFTP write failure. The destination may not be writable, or the server may be out of disk space.".into(),
+                    )
                 } else if message.to_lowercase().contains("not empty") {
                     RemoteFailure::DirectoryNotEmpty
                 } else {

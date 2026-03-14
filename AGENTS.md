@@ -31,8 +31,9 @@ Repo-specific guidance for contributors and coding agents working on `warp`.
 - Do not wire buttons or backend functionality unless the task requires it.
 - Prefer focused changes over broad refactors.
 - Do not add new abstractions without a concrete need.
-- The current remote slice covers connection, trust verification, authentication, remote browsing, basic remote mutation actions (create directory, rename, delete with recursive confirmation when needed, plus multi-select delete), and SFTP upload/download with a Rust-owned batch queue.
+- The current remote slice covers connection, trust verification, authentication, remote browsing, basic remote mutation actions (create directory, rename, delete with recursive confirmation when needed, plus multi-select delete), pane-to-pane drag/drop transfer submission, and SFTP upload/download with a Rust-owned batch queue.
 - The transfer queue is a compact log panel: newest jobs first, batch-oriented rows, inline conflict actions with explicit source/destination context, clearable completed history, and no layout behavior that pushes the split panes upward.
+- Server-side generic SFTP write failures should be surfaced with the operation type and remote path; do not collapse them back to bare `Failure: Failure`.
 - Session liveness is explicit: keepalive and disconnect handling should converge on a clear disconnected state rather than leaving a stale "connected" UI.
 - Do not imply SCP, saved connections, broader remote mutation actions, or other advanced filesystem workflows work unless a task explicitly implements them.
 
@@ -42,4 +43,5 @@ Repo-specific guidance for contributors and coding agents working on `warp`.
 - Frontend build: `npm run build`
 - Rust tests: `cargo test --manifest-path src-tauri/Cargo.toml`
 - Real-host transfer/session validation also runs from `cargo test --manifest-path src-tauri/Cargo.toml`
+- Manual localhost OpenSSH write-path validation: `cargo test --manifest-path src-tauri/Cargo.toml validates_localhost_write_path_via_app_backend -- --ignored --nocapture`
 - AppImage build: `npm run tauri build -- --bundles appimage`

@@ -33,6 +33,8 @@ const HOST: &str = "192.168.178.40";
 const PORT: u16 = 22;
 const USERNAME: &str = "devtest";
 const PASSWORD: &str = "devtest";
+const LOCALHOST_USER: &str = "cyberdyne";
+const LOCALHOST_HOME: &str = "/home/cyberdyne";
 const KEY_PASSPHRASE: &str = "warp-pass";
 
 #[derive(Clone, Copy, Debug)]
@@ -106,6 +108,7 @@ async fn validates_real_host_transfer_and_session_engine() -> Result<()> {
     let manager = Arc::new(SessionManager::new(app.handle().clone(), trust_store_b.clone()));
     let connected = connect_and_trust(&manager, password_request()).await?;
     let remote_home = connected.remote_pane.location.clone();
+    debug_missing_remote_probe_statuses(&manager, &remote_home).await?;
 
     let key_dir = temp_root.join("keys");
     fs::create_dir_all(&key_dir).await?;
@@ -326,9 +329,22 @@ async fn validates_real_host_transfer_and_session_engine() -> Result<()> {
 
     let upload_target = join_remote(&remote_root, "uploads single");
     ensure_remote_dir(&manager, &upload_target).await?;
+    let plain_upload_snapshot = transfer_manager
+        .queue_upload(QueueUploadRequest {
+            entries: vec![selection_item(local_src.join("newfile.txt"), "file")],
+            remote_directory: upload_target.clone(),
+        })
+        .await?;
+    let plain_upload_batch = latest_batch_id(&plain_upload_snapshot)?;
+    wait_for_batch_state(&transfer_manager, &plain_upload_batch, &["Succeeded"]).await?;
+    assert_remote_hash_eq_local(&manager, &join_remote(&upload_target, "newfile.txt"), &local_src.join("newfile.txt")).await?;
+
     let single_upload_snapshot = transfer_manager
         .queue_upload(QueueUploadRequest {
-            entries: vec![selection_item(local_src.join("alpha.txt"), "file")],
+            entries: vec![selection_item(
+                local_src.join("Kopie paspoort 13 mrt 2026 (lucas).pdf"),
+                "file",
+            )],
             remote_directory: upload_target.clone(),
         })
         .await?;
@@ -336,8 +352,8 @@ async fn validates_real_host_transfer_and_session_engine() -> Result<()> {
     wait_for_batch_state(&transfer_manager, &single_upload_batch, &["Succeeded"]).await?;
     assert_remote_hash_eq_local(
         &manager,
-        &join_remote(&upload_target, "alpha.txt"),
-        &local_src.join("alpha.txt"),
+        &join_remote(&upload_target, "Kopie paspoort 13 mrt 2026 (lucas).pdf"),
+        &local_src.join("Kopie paspoort 13 mrt 2026 (lucas).pdf"),
     )
     .await?;
 
@@ -370,6 +386,7 @@ async fn validates_real_host_transfer_and_session_engine() -> Result<()> {
                 selection_item(local_src.join("zero.bin"), "file"),
                 selection_item(local_src.join("space name.txt"), "file"),
                 selection_item(local_src.join("unicodé.txt"), "file"),
+                selection_item(local_src.join("Obsidian.w1zD1f5T.zip.part"), "file"),
             ],
             remote_directory: multi_upload_target.clone(),
         })
@@ -379,6 +396,12 @@ async fn validates_real_host_transfer_and_session_engine() -> Result<()> {
     wait_for_batch_state(&transfer_manager, &multi_upload_batch, &["Succeeded"]).await?;
     assert_remote_hash_eq_local(&manager, &join_remote(&multi_upload_target, "zero.bin"), &local_src.join("zero.bin")).await?;
     assert_remote_hash_eq_local(&manager, &join_remote(&multi_upload_target, "unicodé.txt"), &local_src.join("unicodé.txt")).await?;
+    assert_remote_hash_eq_local(
+        &manager,
+        &join_remote(&multi_upload_target, "Obsidian.w1zD1f5T.zip.part"),
+        &local_src.join("Obsidian.w1zD1f5T.zip.part"),
+    )
+    .await?;
 
     let multi_download_dir = local_downloads.join("multi-download");
     fs::create_dir_all(&multi_download_dir).await?;
@@ -729,6 +752,104 @@ async fn validates_real_host_transfer_and_session_engine() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual localhost SFTP write validation"]
+async fn validates_localhost_write_path_via_app_backend() -> Result<()> {
+    let run_id = format!(
+        "{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    );
+    let temp_root = env::temp_dir().join(format!("warp-localhost-validation-{run_id}"));
+    fs::create_dir_all(&temp_root).await?;
+
+    let app = mock_app();
+    let trust_store = temp_root.join("trust");
+    fs::create_dir_all(&trust_store).await?;
+    let private_key_path = temp_root.join("id_ed25519");
+    generate_test_keypair(&private_key_path)?;
+    let public_key = fs::read_to_string(private_key_path.with_extension("pub")).await?;
+
+    let authorized_keys_path = Path::new(LOCALHOST_HOME).join(".ssh/authorized_keys");
+    let original_authorized_keys = fs::read(&authorized_keys_path).await.unwrap_or_default();
+    let mut next_authorized_keys = original_authorized_keys.clone();
+    if !next_authorized_keys.is_empty() && !next_authorized_keys.ends_with(b"\n") {
+        next_authorized_keys.push(b'\n');
+    }
+    next_authorized_keys.extend_from_slice(public_key.trim().as_bytes());
+    next_authorized_keys.push(b'\n');
+    fs::write(&authorized_keys_path, &next_authorized_keys).await?;
+    Command::new("chown")
+        .args(["cyberdyne:cyberdyne", authorized_keys_path.to_str().ok_or_else(|| anyhow!("invalid authorized_keys path"))?])
+        .status()
+        .context("failed to chown authorized_keys")?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&authorized_keys_path, std::fs::Permissions::from_mode(0o600)).await?;
+    }
+
+    let manager = Arc::new(SessionManager::new(app.handle().clone(), trust_store));
+    let transfer_manager = Arc::new(TransferManager::new(app.handle().clone(), manager.clone()));
+    let remote_root = format!("{LOCALHOST_HOME}/test/warp-localhost-validation-{run_id}");
+    let local_src = temp_root.join("local-src");
+    fs::create_dir_all(&local_src).await?;
+    write_local_file(&local_src.join("testing.txt"), b"localhost-testing\n").await?;
+    write_local_file(&local_src.join("testin2.md"), b"localhost-rename\n").await?;
+
+    let connect_result = connect_and_trust(
+        &manager,
+        ConnectRequest {
+            host: "127.0.0.1".into(),
+            port: PORT,
+            username: LOCALHOST_USER.into(),
+            auth: ConnectAuth::Key {
+                private_key_path: private_key_path.display().to_string(),
+                passphrase: Some(KEY_PASSPHRASE.into()),
+            },
+        },
+    )
+    .await;
+
+    let result = async {
+        let connected = connect_result?;
+        assert_eq!(connected.session.connection_state, "Connected");
+
+        let mkdir_snapshot = manager
+            .create_remote_directory(CreateRemoteDirectoryRequest {
+                parent_path: format!("{LOCALHOST_HOME}/test"),
+                name: format!("warp-localhost-validation-{run_id}"),
+            })
+            .await?;
+        assert!(mkdir_snapshot.session.last_error.is_none(), "mkdir failed: {:?}", mkdir_snapshot.session.last_error);
+
+        let upload_snapshot = transfer_manager
+            .queue_upload(QueueUploadRequest {
+                entries: vec![
+                    selection_item(local_src.join("testing.txt"), "file"),
+                    selection_item(local_src.join("testin2.md"), "file"),
+                ],
+                remote_directory: remote_root.clone(),
+            })
+            .await?;
+        let batch_id = latest_batch_id(&upload_snapshot)?;
+        wait_for_batch_state(&transfer_manager, &batch_id, &["Succeeded"]).await?;
+        assert_remote_hash_eq_local(&manager, &join_remote(&remote_root, "testing.txt"), &local_src.join("testing.txt")).await?;
+        assert_remote_hash_eq_local(&manager, &join_remote(&remote_root, "testin2.md"), &local_src.join("testin2.md")).await?;
+        Ok(())
+    }
+    .await;
+
+    let _ = fs::write(&authorized_keys_path, &original_authorized_keys).await;
+    let _ = Command::new("chown")
+        .args(["cyberdyne:cyberdyne", authorized_keys_path.to_str().unwrap_or_default()])
+        .status();
+    result
+}
+
 fn password_request() -> ConnectRequest {
     ConnectRequest {
         host: HOST.into(),
@@ -808,8 +929,11 @@ async fn restore_authorized_keys<R: Runtime>(
 
 async fn build_local_fixtures(local_src: &Path) -> Result<()> {
     write_local_file(&local_src.join("alpha.txt"), b"alpha-data\n").await?;
+    write_local_file(&local_src.join("newfile.txt"), b"newfile-data\n").await?;
     write_local_file(&local_src.join("space name.txt"), b"space-data\n").await?;
     write_local_file(&local_src.join("unicod\u{e9}.txt"), "unicod\u{e9}\n".as_bytes()).await?;
+    write_local_file(&local_src.join("Kopie paspoort 13 mrt 2026 (lucas).pdf"), b"pdf-bytes\n").await?;
+    write_local_file(&local_src.join("Obsidian.w1zD1f5T.zip.part"), b"partial-zip\n").await?;
     write_local_file(&local_src.join("zero.bin"), b"").await?;
     write_local_file(&local_src.join(".hidden-local"), b"hidden\n").await?;
     write_local_file(&local_src.join("very-long-file-name-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.txt"), b"long\n").await?;
@@ -911,6 +1035,48 @@ async fn read_remote_file<R: Runtime>(manager: &Arc<SessionManager<R>>, path: &s
     let content = read_remote_file_with_sftp(&sftp, path).await?;
     let _ = sftp.close().await;
     Ok(content)
+}
+
+async fn debug_missing_remote_probe_statuses<R: Runtime>(manager: &Arc<SessionManager<R>>, remote_home: &str) -> Result<()> {
+    let sftp = manager.open_transfer_sftp().await?;
+    let missing_plain = join_remote(remote_home, "warp-missing-probe.txt");
+    let missing_hidden = join_remote(remote_home, ".warp-missing-probe.txt");
+
+    println!(
+        "missing remote probe {} => {}",
+        missing_plain,
+        describe_remote_metadata_probe(&sftp, &missing_plain).await
+    );
+    println!(
+        "missing remote probe {} => {}",
+        missing_hidden,
+        describe_remote_metadata_probe(&sftp, &missing_hidden).await
+    );
+
+    let _ = sftp.close().await;
+    Ok(())
+}
+
+async fn describe_remote_metadata_probe(sftp: &SftpSession, path: &str) -> String {
+    match sftp.symlink_metadata(path).await {
+        Ok(metadata) => format!(
+            "ok kind={} size={:?}",
+            if metadata.is_dir() {
+                "dir"
+            } else if metadata.is_symlink() {
+                "symlink"
+            } else {
+                "file"
+            },
+            metadata.size
+        ),
+        Err(SftpError::Status(status)) => format!(
+            "status={:?} message={:?}",
+            status.status_code,
+            status.error_message
+        ),
+        Err(error) => format!("error={error}"),
+    }
 }
 
 async fn read_remote_file_optional_with_sftp(sftp: &SftpSession, path: &str) -> Result<Option<Vec<u8>>> {

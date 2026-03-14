@@ -763,6 +763,7 @@ impl<R: Runtime> TransferManager<R> {
         let temp_path = temp_remote_path(&remote_parent, remote_name, job_id);
 
         ensure_remote_directory_chain(&sftp, &remote_parent).await?;
+        prepare_remote_temp_path(&sftp, &temp_path).await?;
 
         match inspect_remote_conflict(&sftp, remote_path).await {
             Ok(Some(_conflict)) if skip_conflicts && !overwrite_approved => {
@@ -820,17 +821,17 @@ impl<R: Runtime> TransferManager<R> {
             }
         }
 
-        remote_file
-            .sync_all()
-            .await
-            .map_err(|error| anyhow!(classify_transfer_remote_error("flush_file", remote_path, error)))?;
-        remote_file.shutdown().await.map_err(|error| {
-            anyhow!(classify_transfer_remote_error(
-                "close_file",
-                remote_path,
-                SftpError::IO(error.to_string())
-            ))
-        })?;
+        if let Err(error) = remote_file.sync_all().await {
+            let message = classify_transfer_remote_error("flush_file", &temp_path, error);
+            let message = cleanup_remote_temp_after_failure(&sftp, &temp_path, message).await;
+            return Err(anyhow!(message));
+        }
+
+        if let Err(error) = remote_file.shutdown().await {
+            let message = classify_transfer_remote_error("close_file", &temp_path, SftpError::IO(error.to_string()));
+            let message = cleanup_remote_temp_after_failure(&sftp, &temp_path, message).await;
+            return Err(anyhow!(message));
+        }
 
         if overwrite_approved
             && matches!(
@@ -841,14 +842,18 @@ impl<R: Runtime> TransferManager<R> {
                 }))
             )
         {
-            sftp.remove_file(remote_path)
-                .await
-                .map_err(|error| anyhow!(classify_transfer_remote_error("replace_file", remote_path, error)))?;
+            if let Err(error) = sftp.remove_file(remote_path).await {
+                let message = classify_transfer_remote_error("replace_file", remote_path, error);
+                let message = cleanup_remote_temp_after_failure(&sftp, &temp_path, message).await;
+                return Err(anyhow!(message));
+            }
         }
 
-        sftp.rename(&temp_path, remote_path)
-            .await
-            .map_err(|error| anyhow!(classify_transfer_remote_error("finalize_upload", remote_path, error)))?;
+        if let Err(error) = sftp.rename(&temp_path, remote_path).await {
+            let message = classify_transfer_remote_error("finalize_upload", remote_path, error);
+            let message = cleanup_remote_temp_after_failure(&sftp, &temp_path, message).await;
+            return Err(anyhow!(message));
+        }
 
         let _ = sftp.close().await;
         Ok(TransferRunOutcome::Succeeded)
@@ -1636,6 +1641,12 @@ fn batch_completion_message(batch: &TransferBatchRecord) -> String {
     if summary.skipped_files > 0 {
         parts.push(format!("{} skipped", summary.skipped_files));
     }
+    if let Some(failed_child) = batch.children.iter().find(|child| child.view.state == "Failed") {
+        if let Some(error_message) = failed_child.view.error_message.as_ref() {
+            parts.push(format!("{}: {}", failed_child.view.name, error_message));
+        }
+    }
+
     parts.join(", ")
 }
 
@@ -1739,42 +1750,99 @@ async fn inspect_remote_conflict(
     destination_path: &str,
 ) -> Result<Option<TransferConflict>> {
     match sftp.symlink_metadata(destination_path).await {
-        Ok(metadata) => Ok(Some(TransferConflict {
-            destination_exists: true,
-            destination_kind: if metadata.is_dir() {
-                "dir".into()
+        Ok(metadata) => Ok(Some(remote_conflict_from_kind(
+            destination_path,
+            if metadata.is_dir() {
+                "dir"
             } else if metadata.is_symlink() {
-                "symlink".into()
+                "symlink"
             } else {
-                "file".into()
+                "file"
             },
-            source_kind: "unknown".into(),
-            source_name: String::new(),
-            source_path: String::new(),
-            destination_name: Path::new(destination_path)
-                .file_name()
-                .and_then(|value| value.to_str())
-                .unwrap_or_default()
-                .into(),
-            destination_path: destination_path.into(),
-            conflict_kind: if metadata.is_dir() {
-                "typeMismatch".into()
-            } else {
-                "fileExists".into()
-            },
-            can_overwrite: !metadata.is_dir(),
-            apply_to_remaining: true,
-        })),
+        ))),
         Err(SftpError::Status(status))
             if matches!(status.status_code, russh_sftp::protocol::StatusCode::NoSuchFile) =>
         {
             Ok(None)
+        }
+        Err(SftpError::Status(status)) if is_ambiguous_missing_remote_status(&status) => {
+            inspect_remote_conflict_fallback(sftp, destination_path).await
         }
         Err(error) => Err(anyhow!(friendly_remote_transfer_error(
             "inspect the remote destination",
             error
         ))),
     }
+}
+
+async fn inspect_remote_conflict_fallback(
+    sftp: &SftpSession,
+    destination_path: &str,
+) -> Result<Option<TransferConflict>> {
+    match sftp.open(destination_path).await {
+        Ok(file) => {
+            drop(file);
+            return Ok(Some(remote_conflict_from_kind(destination_path, "file")));
+        }
+        Err(SftpError::Status(status))
+            if matches!(status.status_code, russh_sftp::protocol::StatusCode::NoSuchFile) => {}
+        Err(SftpError::Status(status)) if is_ambiguous_missing_remote_status(&status) => {}
+        Err(error) => {
+            return Err(anyhow!(friendly_remote_transfer_error(
+                "inspect the remote destination",
+                error,
+            )))
+        }
+    }
+
+    match sftp.read_dir(destination_path).await {
+        Ok(entries) => {
+            let _ = entries.collect::<Vec<_>>();
+            Ok(Some(remote_conflict_from_kind(destination_path, "dir")))
+        }
+        Err(SftpError::Status(status))
+            if matches!(status.status_code, russh_sftp::protocol::StatusCode::NoSuchFile) =>
+        {
+            Ok(None)
+        }
+        Err(SftpError::Status(status)) if is_ambiguous_missing_remote_status(&status) => Ok(None),
+        Err(error) => Err(anyhow!(friendly_remote_transfer_error(
+            "inspect the remote destination",
+            error,
+        ))),
+    }
+}
+
+fn remote_conflict_from_kind(destination_path: &str, destination_kind: &str) -> TransferConflict {
+    let is_dir = destination_kind == "dir";
+    TransferConflict {
+        destination_exists: true,
+        destination_kind: destination_kind.into(),
+        source_kind: "unknown".into(),
+        source_name: String::new(),
+        source_path: String::new(),
+        destination_name: Path::new(destination_path)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .into(),
+        destination_path: destination_path.into(),
+        conflict_kind: if is_dir {
+            "typeMismatch".into()
+        } else {
+            "fileExists".into()
+        },
+        can_overwrite: !is_dir,
+        apply_to_remaining: true,
+    }
+}
+
+fn is_ambiguous_missing_remote_status(status: &russh_sftp::protocol::Status) -> bool {
+    matches!(status.status_code, russh_sftp::protocol::StatusCode::Failure)
+        && {
+            let message = status.error_message.trim();
+            message.is_empty() || message.eq_ignore_ascii_case("failure")
+        }
 }
 
 async fn ensure_remote_directory_chain(sftp: &SftpSession, path: &str) -> Result<()> {
@@ -1801,6 +1869,51 @@ async fn ensure_remote_directory_chain(sftp: &SftpSession, path: &str) -> Result
     }
 
     Ok(())
+}
+
+async fn prepare_remote_temp_path(sftp: &SftpSession, temp_path: &str) -> Result<()> {
+    match sftp.remove_file(temp_path).await {
+        Ok(_) => Ok(()),
+        Err(SftpError::Status(status))
+            if matches!(status.status_code, russh_sftp::protocol::StatusCode::NoSuchFile)
+                || is_ambiguous_missing_remote_status(&status) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(anyhow!(classify_transfer_remote_error(
+            "cleanup_temp_file",
+            temp_path,
+            error,
+        ))),
+    }
+}
+
+async fn remove_remote_temp_file(sftp: &SftpSession, temp_path: &str) -> Result<()> {
+    match sftp.remove_file(temp_path).await {
+        Ok(_) => Ok(()),
+        Err(SftpError::Status(status))
+            if matches!(status.status_code, russh_sftp::protocol::StatusCode::NoSuchFile) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(anyhow!(classify_transfer_remote_error(
+            "cleanup_temp_file",
+            temp_path,
+            error,
+        ))),
+    }
+}
+
+async fn cleanup_remote_temp_after_failure(sftp: &SftpSession, temp_path: &str, message: String) -> String {
+    let cleanup_message = remove_remote_temp_file(sftp, temp_path)
+        .await
+        .err()
+        .map(|error| error.to_string());
+
+    match cleanup_message {
+        Some(cleanup_error) => format!("{message} Temporary remote file `{temp_path}` could not be removed: {cleanup_error}"),
+        None => message,
+    }
 }
 
 fn temp_local_path(destination_path: &Path, job_id: &str) -> PathBuf {
@@ -1884,6 +1997,12 @@ fn map_copy_io_error(error: std::io::Error) -> CopyFailure {
 }
 
 fn friendly_remote_transfer_error(action: &str, error: SftpError) -> String {
+    if let SftpError::Status(status) = &error {
+        if is_ambiguous_missing_remote_status(status) {
+            return format!("The server reported a generic failure while trying to {action}.");
+        }
+    }
+
     let message = error.to_string().to_lowercase();
     if message.contains("permission denied") {
         return format!("Permission denied while trying to {action}.");
@@ -1914,6 +2033,7 @@ fn classify_transfer_remote_error(action: &str, path: &str, error: SftpError) ->
                 "create_file" | "flush_file" | "replace_file" | "finalize_upload" => {
                     format!("Permission denied while writing remote file `{path}`.")
                 }
+                "cleanup_temp_file" => format!("Permission denied while removing temporary remote file `{path}`."),
                 _ => format!("Permission denied while accessing remote path `{path}`."),
             },
             russh_sftp::protocol::StatusCode::NoSuchFile => match action {
@@ -1921,6 +2041,7 @@ fn classify_transfer_remote_error(action: &str, path: &str, error: SftpError) ->
                 "create_file" | "finalize_upload" => {
                     format!("The remote parent path for `{path}` is no longer available, so Warp could not upload the file.")
                 }
+                "cleanup_temp_file" => format!("The temporary remote file `{path}` is no longer available."),
                 "inspect_file" | "open_file" => {
                     format!("The remote file `{path}` is no longer available.")
                 }
@@ -1933,12 +2054,13 @@ fn classify_transfer_remote_error(action: &str, path: &str, error: SftpError) ->
                 let message = status.error_message.trim();
                 if message.is_empty() || message.eq_ignore_ascii_case("failure") {
                     match action {
-                        "create_dir" => format!("The server could not create remote folder `{path}`."),
-                        "create_file" => format!("The server could not create the remote upload target `{path}`."),
-                        "flush_file" => format!("The server could not finish writing remote file `{path}`."),
-                        "close_file" => format!("The server could not close remote file `{path}` cleanly after writing."),
-                        "replace_file" => format!("The server could not replace the existing remote file at `{path}`."),
-                        "finalize_upload" => format!("The server could not finalize the upload for `{path}`."),
+                        "create_dir" => format!("The server could not create remote folder `{path}`. The host reported a generic SFTP write failure, which often means the destination is not writable or the server is out of disk space."),
+                        "create_file" => format!("The server could not create the remote upload target `{path}`. The host reported a generic SFTP write failure, which often means the destination is not writable or the server is out of disk space."),
+                        "flush_file" => format!("The server could not finish writing remote file `{path}`. The host reported a generic SFTP write failure, which often means the destination is not writable or the server is out of disk space."),
+                        "close_file" => format!("The server could not close remote file `{path}` cleanly after writing. The host reported a generic SFTP write failure, which often means the destination is not writable or the server is out of disk space."),
+                        "replace_file" => format!("The server could not replace the existing remote file at `{path}`. The host reported a generic SFTP write failure, which often means the destination is not writable or the server is out of disk space."),
+                        "finalize_upload" => format!("The server could not finalize the upload for `{path}`. The host reported a generic SFTP write failure, which often means the destination is not writable or the server is out of disk space."),
+                        "cleanup_temp_file" => format!("The server could not remove temporary remote file `{path}`. The host reported a generic SFTP write failure, which often means the destination is not writable or the server is out of disk space."),
                         "inspect_file" | "open_file" => format!("The server could not access remote file `{path}`."),
                         _ => format!("The server could not complete the remote operation for `{path}`."),
                     }
@@ -1970,8 +2092,12 @@ impl TransferDirection {
 
 #[cfg(test)]
 mod tests {
-    use super::{batch_display_name, format_rate, join_remote_path, progress_fraction};
-    use crate::models::TransferSelectionItem;
+    use super::{
+        batch_completion_message, batch_display_name, format_rate, join_remote_path,
+        progress_fraction, ConflictPolicy, PlannedItemKind, TransferBatchRecord,
+        TransferChildRecord, TransferChildTask,
+    };
+    use crate::models::{TransferConflict, TransferJob, TransferJobSummary, TransferSelectionItem};
 
     #[test]
     fn joins_remote_paths_without_double_slashes() {
@@ -2005,5 +2131,84 @@ mod tests {
             },
         ];
         assert_eq!(batch_display_name(&entries), "2 items");
+    }
+
+    #[test]
+    fn batch_completion_message_includes_first_failed_child_reason() {
+        let mut batch = TransferBatchRecord {
+            id: "batch-1".into(),
+            direction: super::TransferDirection::Upload,
+            destination_root: "/remote".into(),
+            conflict_policy: ConflictPolicy::Ask,
+            pause_message: None,
+            cancel_requested: false,
+            view: TransferJob {
+                id: "batch-1".into(),
+                kind: "batch".into(),
+                batch_id: None,
+                parent_id: None,
+                protocol: "SFTP".into(),
+                direction: "Upload".into(),
+                name: "example".into(),
+                source_path: "/tmp/example".into(),
+                destination_path: "/remote/example".into(),
+                rate: None,
+                bytes_total: None,
+                bytes_transferred: 0,
+                progress_percent: Some(0),
+                state: "Failed".into(),
+                error_message: None,
+                conflict: None::<TransferConflict>,
+                can_cancel: false,
+                can_retry: true,
+                summary: Some(TransferJobSummary {
+                    total_files: 1,
+                    total_directories: 0,
+                    completed_files: 0,
+                    failed_files: 1,
+                    skipped_files: 0,
+                }),
+                current_item_label: None,
+            },
+            children: vec![TransferChildRecord {
+                id: "child-1".into(),
+                batch_id: "batch-1".into(),
+                item_kind: PlannedItemKind::File,
+                task: TransferChildTask::UploadFile {
+                    local_path: "/tmp/example".into(),
+                    remote_path: "/remote/example".into(),
+                },
+                overwrite_approved: false,
+                view: TransferJob {
+                    id: "child-1".into(),
+                    kind: "child".into(),
+                    batch_id: Some("batch-1".into()),
+                    parent_id: Some("batch-1".into()),
+                    protocol: "SFTP".into(),
+                    direction: "Upload".into(),
+                    name: "example.txt".into(),
+                    source_path: "/tmp/example.txt".into(),
+                    destination_path: "/remote/example.txt".into(),
+                    rate: None,
+                    bytes_total: Some(10),
+                    bytes_transferred: 0,
+                    progress_percent: Some(0),
+                    state: "Failed".into(),
+                    error_message: Some("The server could not finalize the upload for `/remote/example.txt`.".into()),
+                    conflict: None::<TransferConflict>,
+                    can_cancel: false,
+                    can_retry: true,
+                    summary: None,
+                    current_item_label: None,
+                },
+            }],
+        };
+
+        batch.view.error_message = Some(batch_completion_message(&batch));
+
+        assert_eq!(
+            batch.view.error_message.as_deref(),
+            Some("0 completed, 1 failed, example.txt: The server could not finalize the upload for `/remote/example.txt`.")
+        );
     }
 }

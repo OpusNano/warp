@@ -39,6 +39,16 @@ import type {
   TrustPrompt,
 } from './lib/types'
 
+const TRANSFER_DRAG_MIME = 'application/x-warp-transfer'
+
+type TransferDragState = {
+  sourcePaneId: PaneId
+  entryNames: string[]
+  entries: TransferSelectionItem[]
+  targetPaneId: PaneId | null
+  targetDirectoryPath: string | null
+}
+
 const defaultState: AppBootstrap = {
   connectionProfiles: [],
   session: {
@@ -236,7 +246,8 @@ function App() {
   const [shortcuts, setShortcuts] = createSignal(defaultState.shortcuts)
   const [activePane, setActivePane] = createSignal<PaneId>('local')
   const [dividerRatio, setDividerRatio] = createSignal(0.5)
-  const [dragging, setDragging] = createSignal(false)
+  const [dividerDragging, setDividerDragging] = createSignal(false)
+  const [transferDragState, setTransferDragState] = createSignal<TransferDragState | null>(null)
   const [localFilter, setLocalFilter] = createSignal('')
   const [remoteFilter, setRemoteFilter] = createSignal('')
   const [localSelection, setLocalSelection] = createSignal<string[]>([])
@@ -324,6 +335,7 @@ function App() {
     applyRemoteSnapshot(snapshot, primarySelection(remoteSelection()))
     if (snapshot.session.connectionState === 'Disconnected') {
       clearPaneTransientUi('remote')
+      clearTransferDragState()
       setTrustPrompt(null)
       setRemoteSelection([])
       setRemoteSelectionAnchor(null)
@@ -508,11 +520,11 @@ function App() {
   }
 
   const onPointerMove = (event: PointerEvent) => {
-    if (!dragging()) return
+    if (!dividerDragging()) return
     resize(event.clientX)
   }
 
-  const stopDragging = () => setDragging(false)
+  const stopDragging = () => setDividerDragging(false)
 
   const filteredEntries = (pane: PaneSnapshot, filterValue: string) => {
     const filter = filterValue.trim().toLowerCase()
@@ -529,10 +541,82 @@ function App() {
   const remoteEntries = createMemo(() => filteredEntries(remotePane(), remoteFilter()))
   const orderedTransferJobs = createMemo(() => [...transfers().jobs].reverse())
 
+  const draggedEntryCount = createMemo(() => transferDragState()?.entryNames.length ?? 0)
+
   const paneClass = (paneId: PaneId) =>
     activePane() === paneId
       ? 'border-white/70 bg-white/[0.03] shadow-[inset_0_0_0_1px_rgba(255,255,255,0.12)]'
       : 'border-white/10 bg-white/[0.015]'
+
+  const clearTransferDragState = () => {
+    setTransferDragState(null)
+  }
+
+  const paneReadyForDrop = (paneId: PaneId) => {
+    if (paneId === 'local') {
+      return !localLoading()
+    }
+
+    return !remoteLoading() && session().connectionState === 'Connected' && remotePane().location !== 'Not connected'
+  }
+
+  const isValidTransferDrop = (sourcePaneId: PaneId, targetPaneId: PaneId, targetEntry?: FileEntry | null) => {
+    if (sourcePaneId === targetPaneId) return false
+    if (!paneReadyForDrop(targetPaneId)) return false
+    if (targetEntry && targetEntry.kind !== 'dir') return false
+    return true
+  }
+
+  const setTransferDropTarget = (targetPaneId: PaneId, targetEntry?: FileEntry | null) => {
+    const state = transferDragState()
+    if (!state) return false
+    if (!isValidTransferDrop(state.sourcePaneId, targetPaneId, targetEntry)) return false
+
+    setTransferDragState({
+      ...state,
+      targetPaneId,
+      targetDirectoryPath: targetEntry?.path ?? null,
+    })
+    return true
+  }
+
+  const clearTransferDropTarget = (targetPaneId: PaneId, targetEntry?: FileEntry | null) => {
+    const state = transferDragState()
+    if (!state || state.targetPaneId !== targetPaneId) return
+
+    if (targetEntry) {
+      if (state.targetDirectoryPath !== targetEntry.path) return
+      setTransferDragState({ ...state, targetDirectoryPath: null })
+      return
+    }
+
+    setTransferDragState({ ...state, targetPaneId: null, targetDirectoryPath: null })
+  }
+
+  const destinationPathForDrop = (paneId: PaneId, targetEntry?: FileEntry | null) => {
+    if (targetEntry?.kind === 'dir') return targetEntry.path
+    return paneId === 'local' ? localPane().location : remotePane().location
+  }
+
+  const transferDragActiveForPane = (paneId: PaneId) => {
+    const state = transferDragState()
+    return state !== null && state.targetPaneId === paneId && isValidTransferDrop(state.sourcePaneId, paneId)
+  }
+
+  const transferDragActiveForDirectory = (paneId: PaneId, entry: FileEntry) => {
+    const state = transferDragState()
+    return state !== null && state.targetPaneId === paneId && state.targetDirectoryPath === entry.path
+  }
+
+  const isTransferDragSource = (paneId: PaneId, entry: FileEntry) => {
+    const state = transferDragState()
+    return state !== null && state.sourcePaneId === paneId && state.entryNames.includes(entry.name)
+  }
+
+  const isInternalTransferDragEvent = (event: DragEvent) => {
+    if (transferDragState()) return true
+    return Array.from(event.dataTransfer?.types ?? []).includes(TRANSFER_DRAG_MIME)
+  }
 
   const selectionForPane = (paneId: PaneId) => (paneId === 'local' ? localSelection() : remoteSelection())
   const selectionAnchorForPane = (paneId: PaneId) => (paneId === 'local' ? localSelectionAnchor() : remoteSelectionAnchor())
@@ -590,10 +674,142 @@ function App() {
     return pane.entries.filter((entry) => selectedNames.has(entry.name))
   }
 
+  const transferEntriesForDragStart = (paneId: PaneId, entry: FileEntry) => {
+    const currentSelection = selectedEntriesForPane(paneId)
+    const selectedNames = new Set(currentSelection.map((item) => item.name))
+    const entries = selectedNames.has(entry.name) ? currentSelection : [entry]
+    return {
+      entryNames: entries.map((item) => item.name),
+      entries: selectionItems(entries),
+    }
+  }
+
+  const startTransferDrag = (paneId: PaneId, entry: FileEntry, event: DragEvent) => {
+    if (!event.dataTransfer) return
+
+    const payload = transferEntriesForDragStart(paneId, entry)
+    setTransferDragState({
+      sourcePaneId: paneId,
+      entryNames: payload.entryNames,
+      entries: payload.entries,
+      targetPaneId: null,
+      targetDirectoryPath: null,
+    })
+    event.dataTransfer.effectAllowed = 'copy'
+    event.dataTransfer.setData(TRANSFER_DRAG_MIME, JSON.stringify({ sourcePaneId: paneId, count: payload.entries.length }))
+    event.dataTransfer.setData('text/plain', payload.entryNames.join('\n'))
+  }
+
+  const finishTransferDrag = () => {
+    clearTransferDragState()
+  }
+
+  const queueDroppedTransfer = async (targetPaneId: PaneId, targetEntry?: FileEntry | null) => {
+    const state = transferDragState()
+    if (!state || !isValidTransferDrop(state.sourcePaneId, targetPaneId, targetEntry)) return
+
+    const destinationPath = destinationPathForDrop(targetPaneId, targetEntry)
+
+    try {
+      const snapshot =
+        state.sourcePaneId === 'local'
+          ? await queueUpload({
+              entries: state.entries,
+              remoteDirectory: destinationPath,
+            })
+          : await queueDownload({
+              entries: state.entries,
+              localDirectory: destinationPath,
+            })
+      applyTransferSnapshot(snapshot)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : `Failed to queue ${state.sourcePaneId === 'local' ? 'upload' : 'download'}.`
+      if (state.sourcePaneId === 'local') {
+        setLocalError(message)
+      } else {
+        setRemoteRuntimeError(message)
+      }
+    } finally {
+      clearTransferDragState()
+    }
+  }
+
+  const leftDragRegion = (event: DragEvent) => {
+    if (!(event.currentTarget instanceof HTMLElement)) return true
+    const relatedTarget = event.relatedTarget
+    return !(relatedTarget instanceof Node) || !event.currentTarget.contains(relatedTarget)
+  }
+
+  const handlePaneDragEnter = (paneId: PaneId, event: DragEvent) => {
+    if (event.defaultPrevented) return
+    if (!isInternalTransferDragEvent(event)) return
+    if (setTransferDropTarget(paneId)) {
+      event.preventDefault()
+    }
+  }
+
+  const handlePaneDragOver = (paneId: PaneId, event: DragEvent) => {
+    if (event.defaultPrevented) return
+    if (!isInternalTransferDragEvent(event)) return
+    if (setTransferDropTarget(paneId)) {
+      event.preventDefault()
+      if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy'
+    }
+  }
+
+  const handlePaneDragLeave = (paneId: PaneId, event: DragEvent) => {
+    if (!isInternalTransferDragEvent(event) || !leftDragRegion(event)) return
+    clearTransferDropTarget(paneId)
+  }
+
+  const handlePaneDrop = (paneId: PaneId, event: DragEvent) => {
+    if (event.defaultPrevented) return
+    if (!isInternalTransferDragEvent(event)) return
+    if (!setTransferDropTarget(paneId)) return
+    event.preventDefault()
+    void queueDroppedTransfer(paneId)
+  }
+
+  const handleEntryDragEnter = (paneId: PaneId, entry: FileEntry, event: DragEvent) => {
+    if (!isInternalTransferDragEvent(event)) return
+    if (setTransferDropTarget(paneId, entry)) {
+      event.preventDefault()
+      event.stopPropagation()
+    }
+  }
+
+  const handleEntryDragOver = (paneId: PaneId, entry: FileEntry, event: DragEvent) => {
+    if (!isInternalTransferDragEvent(event)) return
+    if (setTransferDropTarget(paneId, entry)) {
+      event.preventDefault()
+      event.stopPropagation()
+      if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy'
+    }
+  }
+
+  const handleEntryDragLeave = (paneId: PaneId, entry: FileEntry, event: DragEvent) => {
+    if (!isInternalTransferDragEvent(event) || !leftDragRegion(event)) return
+    event.stopPropagation()
+    clearTransferDropTarget(paneId, entry)
+  }
+
+  const handleEntryDrop = (paneId: PaneId, entry: FileEntry, event: DragEvent) => {
+    if (!isInternalTransferDragEvent(event)) return
+    if (!setTransferDropTarget(paneId, entry)) return
+    event.preventDefault()
+    event.stopPropagation()
+    void queueDroppedTransfer(paneId, entry)
+  }
+
   const selectEntry = (paneId: PaneId, entry: FileEntry, event?: MouseEvent) => {
     const entries = paneId === 'local' ? localEntries() : remoteEntries()
     const currentSelection = selectionForPane(paneId)
     const currentAnchor = selectionAnchorForPane(paneId)
+
+    if (!event?.shiftKey && !event?.metaKey && !event?.ctrlKey && currentSelection.length > 1 && currentSelection.includes(entry.name)) {
+      activatePane(paneId)
+      return
+    }
 
     if (event?.shiftKey) {
       const anchorName = currentAnchor ?? currentSelection[0] ?? entry.name
@@ -1094,7 +1310,7 @@ function App() {
   }
 
   const handleShortcut = (event: KeyboardEvent) => {
-    if (dragging()) return
+    if (dividerDragging()) return
 
     if (pendingDeleteTarget()) {
       if (event.key === 'Escape') {
@@ -1341,6 +1557,8 @@ function App() {
                   entries={localEntries()}
                   active={activePane() === 'local'}
                   paneClass={paneClass('local')}
+                  dragActive={transferDragActiveForPane('local')}
+                  dragCount={draggedEntryCount()}
                   filterValue={localFilter()}
                   selectedNames={localSelection()}
                   loading={localLoading()}
@@ -1368,12 +1586,24 @@ function App() {
                   onFocus={() => activatePane('local')}
                   onSelect={(entry, event) => selectEntry('local', entry, event)}
                   onEntryOpen={(entry) => void openEntry('local', entry)}
+                  onEntryDragStart={(entry, event) => startTransferDrag('local', entry, event)}
+                  onEntryDragEnd={finishTransferDrag}
+                  onEntryDragEnter={(entry, event) => handleEntryDragEnter('local', entry, event)}
+                  onEntryDragOver={(entry, event) => handleEntryDragOver('local', entry, event)}
+                  onEntryDragLeave={(entry, event) => handleEntryDragLeave('local', entry, event)}
+                  onEntryDrop={(entry, event) => handleEntryDrop('local', entry, event)}
+                  isEntryDragTarget={(entry) => transferDragActiveForDirectory('local', entry)}
+                  isEntryDragSource={(entry) => isTransferDragSource('local', entry)}
                   onRenameStart={() => startInlineRename('local')}
                   onRenameDraft={setRenameDraft}
                   onRenameCommit={() => void commitInlineRename('local')}
                   onRenameCancel={() => cancelInlineRename('local')}
                   onUp={() => void goUpInPane('local')}
                   onRefresh={() => void refreshPane('local')}
+                  onPaneDragEnter={(event) => handlePaneDragEnter('local', event)}
+                  onPaneDragOver={(event) => handlePaneDragOver('local', event)}
+                  onPaneDragLeave={(event) => handlePaneDragLeave('local', event)}
+                  onPaneDrop={(event) => handlePaneDrop('local', event)}
                   transferActionLabel="Upload"
                   onTransfer={() => void queueSelectedUpload()}
                   transferDisabled={uploadCandidate().length === 0 || localLoading() || remoteLoading()}
@@ -1385,9 +1615,9 @@ function App() {
                 <button
                   type="button"
                   aria-label="Resize panes"
-                  class={`flex h-full w-3 cursor-col-resize items-center justify-center rounded-full transition ${dragging() ? 'bg-white/12' : 'bg-transparent hover:bg-white/6'}`}
+                  class={`flex h-full w-3 cursor-col-resize items-center justify-center rounded-full transition ${dividerDragging() ? 'bg-white/12' : 'bg-transparent hover:bg-white/6'}`}
                   onPointerDown={(event) => {
-                    setDragging(true)
+                    setDividerDragging(true)
                     resize(event.clientX)
                   }}
                 >
@@ -1401,6 +1631,8 @@ function App() {
                   entries={remoteEntries()}
                   active={activePane() === 'remote'}
                   paneClass={paneClass('remote')}
+                  dragActive={transferDragActiveForPane('remote')}
+                  dragCount={draggedEntryCount()}
                   filterValue={remoteFilter()}
                   selectedNames={remoteSelection()}
                   loading={remoteLoading()}
@@ -1431,6 +1663,14 @@ function App() {
                   onFocus={() => activatePane('remote')}
                   onSelect={(entry, event) => selectEntry('remote', entry, event)}
                   onEntryOpen={(entry) => void openEntry('remote', entry)}
+                  onEntryDragStart={(entry, event) => startTransferDrag('remote', entry, event)}
+                  onEntryDragEnd={finishTransferDrag}
+                  onEntryDragEnter={(entry, event) => handleEntryDragEnter('remote', entry, event)}
+                  onEntryDragOver={(entry, event) => handleEntryDragOver('remote', entry, event)}
+                  onEntryDragLeave={(entry, event) => handleEntryDragLeave('remote', entry, event)}
+                  onEntryDrop={(entry, event) => handleEntryDrop('remote', entry, event)}
+                  isEntryDragTarget={(entry) => transferDragActiveForDirectory('remote', entry)}
+                  isEntryDragSource={(entry) => isTransferDragSource('remote', entry)}
                   onRenameStart={() => startInlineRename('remote')}
                   onRenameDraft={setRenameDraft}
                   onRenameCommit={() => void commitInlineRename('remote')}
@@ -1441,6 +1681,10 @@ function App() {
                   onCreateDirectoryCancel={() => cancelCreateDirectory('remote')}
                   onUp={() => void goUpInPane('remote')}
                   onRefresh={() => void refreshPane('remote')}
+                  onPaneDragEnter={(event) => handlePaneDragEnter('remote', event)}
+                  onPaneDragOver={(event) => handlePaneDragOver('remote', event)}
+                  onPaneDragLeave={(event) => handlePaneDragLeave('remote', event)}
+                  onPaneDrop={(event) => handlePaneDrop('remote', event)}
                   transferActionLabel="Download"
                   onTransfer={() => void queueSelectedDownload()}
                   transferDisabled={downloadCandidate().length === 0 || remoteLoading() || localLoading()}
@@ -1634,6 +1878,8 @@ type PaneProps = {
   entries: FileEntry[]
   active: boolean
   paneClass: string
+  dragActive: boolean
+  dragCount: number
   filterValue: string
   selectedNames: string[]
   loading: boolean
@@ -1651,6 +1897,14 @@ type PaneProps = {
   onFocus: () => void
   onSelect: (entry: FileEntry, event: MouseEvent) => void
   onEntryOpen: (entry: FileEntry) => void
+  onEntryDragStart?: (entry: FileEntry, event: DragEvent) => void
+  onEntryDragEnd?: () => void
+  onEntryDragEnter?: (entry: FileEntry, event: DragEvent) => void
+  onEntryDragOver?: (entry: FileEntry, event: DragEvent) => void
+  onEntryDragLeave?: (entry: FileEntry, event: DragEvent) => void
+  onEntryDrop?: (entry: FileEntry, event: DragEvent) => void
+  isEntryDragTarget?: (entry: FileEntry) => boolean
+  isEntryDragSource?: (entry: FileEntry) => boolean
   onRenameStart?: () => void
   onRenameDraft?: (value: string) => void
   onRenameCommit?: () => void
@@ -1661,6 +1915,10 @@ type PaneProps = {
   onCreateDirectoryCancel?: () => void
   onUp?: () => void
   onRefresh?: () => void
+  onPaneDragEnter?: (event: DragEvent) => void
+  onPaneDragOver?: (event: DragEvent) => void
+  onPaneDragLeave?: (event: DragEvent) => void
+  onPaneDrop?: (event: DragEvent) => void
   transferActionLabel?: string
   onTransfer?: () => void
   transferDisabled?: boolean
@@ -1670,12 +1928,14 @@ type PaneProps = {
 function Pane(props: PaneProps) {
   const filteredCount = () => props.entries.length
   const paneStatus = () => {
+    if (props.dragActive) return 'Drop Target'
     if (props.loading) return 'Loading'
     if (props.errorMessage) return 'Error'
     return props.active ? 'Focused' : 'Idle'
   }
 
   const paneStatusClass = () => {
+    if (props.dragActive) return 'border-emerald-300/50 text-emerald-100'
     if (props.loading) return 'border-white/20 text-white'
     if (props.errorMessage) return 'border-red-300/30 text-red-200'
     return 'border-white/10 text-zinc-400'
@@ -1697,7 +1957,7 @@ function Pane(props: PaneProps) {
   return (
     <section
       ref={props.setPaneRef}
-      class={`flex h-full min-h-0 flex-col rounded-lg border transition ${props.paneClass}`}
+      class={`flex h-full min-h-0 flex-col rounded-lg border transition ${props.paneClass} ${props.dragActive ? 'border-emerald-300/60 bg-emerald-300/[0.05] shadow-[inset_0_0_0_1px_rgba(110,231,183,0.18)]' : ''}`}
       onMouseDown={props.onFocus}
       onFocusIn={props.onFocus}
       tabindex={0}
@@ -1791,7 +2051,13 @@ function Pane(props: PaneProps) {
         <div>Perms</div>
       </div>
 
-      <div class="relative min-h-0 flex-1 overflow-auto">
+      <div
+        class="relative min-h-0 flex-1 overflow-auto"
+        onDragEnter={props.onPaneDragEnter}
+        onDragOver={props.onPaneDragOver}
+        onDragLeave={props.onPaneDragLeave}
+        onDrop={props.onPaneDrop}
+      >
         <Show
           when={props.entries.length > 0}
           fallback={
@@ -1805,12 +2071,21 @@ function Pane(props: PaneProps) {
               {(entry) => {
                 const isSelected = () => props.selectedNames.includes(entry.name)
                 const isEditing = () => props.editingName === entry.name
+                const isDragTarget = () => props.isEntryDragTarget?.(entry) ?? false
+                const isDragSource = () => props.isEntryDragSource?.(entry) ?? false
 
                 return (
                   <div
-                    class={`grid w-full grid-cols-[minmax(0,1.8fr)_110px_130px_90px] gap-3 px-4 py-3 text-left transition ${isSelected() ? 'bg-white/[0.08]' : 'hover:bg-white/[0.03]'}`}
+                    class={`grid w-full grid-cols-[minmax(0,1.8fr)_110px_130px_90px] gap-3 px-4 py-3 text-left transition ${isDragTarget() ? 'bg-emerald-300/[0.14] ring-1 ring-inset ring-emerald-300/40' : isSelected() ? 'bg-white/[0.08]' : 'hover:bg-white/[0.03]'} ${isDragSource() ? 'opacity-55' : ''}`}
                     onPointerDown={(event) => props.onSelect(entry, event)}
                     onDblClick={() => props.onEntryOpen(entry)}
+                    draggable={!isEditing()}
+                    onDragStart={(event) => props.onEntryDragStart?.(entry, event)}
+                    onDragEnd={() => props.onEntryDragEnd?.()}
+                    onDragEnter={(event) => props.onEntryDragEnter?.(entry, event)}
+                    onDragOver={(event) => props.onEntryDragOver?.(entry, event)}
+                    onDragLeave={(event) => props.onEntryDragLeave?.(entry, event)}
+                    onDrop={(event) => props.onEntryDrop?.(entry, event)}
                   >
                     <div class="min-w-0 w-full">
                       <div class="relative min-w-0 w-full">
@@ -1859,6 +2134,12 @@ function Pane(props: PaneProps) {
         <Show when={props.loading && props.entries.length > 0}>
           <div class="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/50 px-6 text-center font-mono text-sm text-white backdrop-blur-[1px]">
             Loading directory...
+          </div>
+        </Show>
+
+        <Show when={props.dragActive && !props.loading}>
+          <div class="pointer-events-none absolute inset-x-4 bottom-4 rounded-md border border-emerald-300/30 bg-emerald-300/12 px-3 py-2 font-mono text-[11px] uppercase tracking-[0.18em] text-emerald-100">
+            Drop {props.dragCount === 1 ? '1 item' : `${props.dragCount} items`} into {props.pane.title.toLowerCase()}
           </div>
         </Show>
       </div>
