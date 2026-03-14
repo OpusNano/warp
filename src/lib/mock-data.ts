@@ -43,6 +43,11 @@ export const mockBootstrap: AppBootstrap = {
       entries: [],
     },
   },
-  transfers: [],
+  transfers: {
+    jobs: [],
+    activeJobId: null,
+    queuedCount: 0,
+    finishedCount: 0,
+  },
   shortcuts: ['Tab pane', 'Ctrl+1 local', 'Ctrl+2 remote', 'Ctrl+F filter', 'F5 refresh'],
 }

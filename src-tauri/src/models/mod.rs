@@ -6,7 +6,7 @@ pub struct AppBootstrap {
     pub connection_profiles: Vec<ConnectionProfile>,
     pub session: SessionSnapshot,
     pub panes: PaneSet,
-    pub transfers: Vec<TransferJob>,
+    pub transfers: TransferQueueSnapshot,
     pub shortcuts: Vec<String>,
 }
 
@@ -66,10 +66,33 @@ pub struct TransferJob {
     pub protocol: String,
     pub direction: String,
     pub name: String,
-    pub path: String,
+    pub source_path: String,
+    pub destination_path: String,
     pub rate: Option<String>,
+    pub bytes_total: Option<u64>,
+    pub bytes_transferred: u64,
     pub progress_percent: Option<u8>,
     pub state: String,
+    pub error_message: Option<String>,
+    pub conflict: Option<TransferConflict>,
+    pub can_cancel: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferConflict {
+    pub destination_exists: bool,
+    pub destination_kind: String,
+    pub can_overwrite: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferQueueSnapshot {
+    pub jobs: Vec<TransferJob>,
+    pub active_job_id: Option<String>,
+    pub queued_count: usize,
+    pub finished_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -120,7 +143,38 @@ pub struct TrustDecision {
     pub trust: bool,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueueDownloadRequest {
+    pub remote_path: String,
+    pub remote_name: String,
+    pub local_directory: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueueUploadRequest {
+    pub local_path: String,
+    pub local_name: String,
+    pub remote_directory: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferConflictResolution {
+    pub action: String,
+}
+
 impl AppBootstrap {
+    pub fn empty_transfers() -> TransferQueueSnapshot {
+        TransferQueueSnapshot {
+            jobs: Vec::new(),
+            active_job_id: None,
+            queued_count: 0,
+            finished_count: 0,
+        }
+    }
+
     pub fn remote_placeholder() -> PaneSnapshot {
         PaneSnapshot {
             id: "remote".into(),

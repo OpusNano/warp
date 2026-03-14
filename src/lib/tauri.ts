@@ -1,6 +1,16 @@
 import { invoke } from '@tauri-apps/api/core'
 import { mockBootstrap } from './mock-data'
-import type { AppBootstrap, ConnectRequest, PaneSnapshot, RemoteConnectionSnapshot, TrustDecision } from './types'
+import type {
+  AppBootstrap,
+  ConnectRequest,
+  PaneSnapshot,
+  QueueDownloadRequest,
+  QueueUploadRequest,
+  RemoteConnectionSnapshot,
+  TransferConflictResolution,
+  TransferQueueSnapshot,
+  TrustDecision,
+} from './types'
 
 declare global {
   interface Window {
@@ -130,4 +140,55 @@ export async function goUpRemoteDirectory(): Promise<RemoteConnectionSnapshot> {
   }
 
   return invoke<RemoteConnectionSnapshot>('go_up_remote_directory')
+}
+
+export async function queueDownload(request: QueueDownloadRequest): Promise<TransferQueueSnapshot> {
+  if (!window.__TAURI_INTERNALS__) {
+    return mockBootstrap.transfers
+  }
+
+  return invoke<TransferQueueSnapshot>('queue_download', { request })
+}
+
+export async function queueUpload(request: QueueUploadRequest): Promise<TransferQueueSnapshot> {
+  if (!window.__TAURI_INTERNALS__) {
+    return mockBootstrap.transfers
+  }
+
+  return invoke<TransferQueueSnapshot>('queue_upload', { request })
+}
+
+export async function listTransferJobs(): Promise<TransferQueueSnapshot> {
+  if (!window.__TAURI_INTERNALS__) {
+    return mockBootstrap.transfers
+  }
+
+  return invoke<TransferQueueSnapshot>('list_transfer_jobs')
+}
+
+export async function cancelTransfer(jobId: string): Promise<TransferQueueSnapshot> {
+  if (!window.__TAURI_INTERNALS__) {
+    return mockBootstrap.transfers
+  }
+
+  return invoke<TransferQueueSnapshot>('cancel_transfer', { jobId })
+}
+
+export async function resolveTransferConflict(
+  jobId: string,
+  resolution: TransferConflictResolution,
+): Promise<TransferQueueSnapshot> {
+  if (!window.__TAURI_INTERNALS__) {
+    return mockBootstrap.transfers
+  }
+
+  return invoke<TransferQueueSnapshot>('resolve_transfer_conflict', { jobId, resolution })
+}
+
+export async function clearCompletedTransfers(): Promise<TransferQueueSnapshot> {
+  if (!window.__TAURI_INTERNALS__) {
+    return mockBootstrap.transfers
+  }
+
+  return invoke<TransferQueueSnapshot>('clear_completed_transfers')
 }

@@ -1,4 +1,11 @@
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use russh::{
@@ -6,9 +13,11 @@ use russh::{
     keys::{Algorithm, HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKey},
 };
 use russh_sftp::client::SftpSession;
-use tokio::sync::Mutex;
+use tauri::{AppHandle, Emitter};
+use tokio::{sync::Mutex, time};
 
 use crate::{
+    events::REMOTE_SESSION_UPDATED_EVENT,
     models::{
         AppBootstrap, ConnectAuth, ConnectRequest, RemoteConnectionSnapshot, SessionSnapshot,
         TrustDecision, TrustPrompt,
@@ -18,7 +27,9 @@ use crate::{
 };
 
 pub struct SessionManager {
+    app_handle: AppHandle,
     trust_model: TrustModel,
+    next_session_id: AtomicU64,
     state: Mutex<SessionState>,
 }
 
@@ -29,6 +40,7 @@ struct SessionState {
 }
 
 struct ActiveRemoteSession {
+    id: u64,
     request: ConnectRequest,
     handle: client::Handle<SshClientHandler>,
     sftp: SftpSession,
@@ -69,9 +81,11 @@ struct SshClientHandler {
 }
 
 impl SessionManager {
-    pub fn new(base_dir: std::path::PathBuf) -> Self {
+    pub fn new(app_handle: AppHandle, base_dir: std::path::PathBuf) -> Self {
         Self {
+            app_handle,
             trust_model: TrustModel::new(base_dir),
+            next_session_id: AtomicU64::new(1),
             state: Mutex::new(SessionState {
                 active: None,
                 pending_trust: None,
@@ -80,7 +94,7 @@ impl SessionManager {
         }
     }
 
-    pub async fn connect(&self, request: ConnectRequest) -> Result<RemoteConnectionSnapshot> {
+    pub async fn connect(self: &Arc<Self>, request: ConnectRequest) -> Result<RemoteConnectionSnapshot> {
         self.disconnect_internal().await;
 
         match self
@@ -88,11 +102,15 @@ impl SessionManager {
             .await
         {
             Ok(active) => {
+                let active_id = active.id;
                 let mut state = self.state.lock().await;
                 state.last_error = None;
                 state.pending_trust = None;
                 state.active = Some(active);
-                Ok(snapshot_from_state(&state))
+                let snapshot = snapshot_from_state(&state);
+                drop(state);
+                self.spawn_liveness_monitor(active_id);
+                Ok(snapshot)
             }
             Err(ConnectOutcome::TrustRequired { prompt, server_key }) => {
                 let mut state = self.state.lock().await;
@@ -115,12 +133,12 @@ impl SessionManager {
         }
     }
 
-    pub async fn snapshot(&self) -> RemoteConnectionSnapshot {
+    pub async fn snapshot(self: &Arc<Self>) -> RemoteConnectionSnapshot {
         let state = self.state.lock().await;
         snapshot_from_state(&state)
     }
 
-    pub async fn resolve_trust(&self, decision: TrustDecision) -> Result<RemoteConnectionSnapshot> {
+    pub async fn resolve_trust(self: &Arc<Self>, decision: TrustDecision) -> Result<RemoteConnectionSnapshot> {
         let pending = {
             let mut state = self.state.lock().await;
             state.active = None;
@@ -156,11 +174,15 @@ impl SessionManager {
             .await
         {
             Ok(active) => {
+                let active_id = active.id;
                 let mut state = self.state.lock().await;
                 state.last_error = None;
                 state.pending_trust = None;
                 state.active = Some(active);
-                Ok(snapshot_from_state(&state))
+                let snapshot = snapshot_from_state(&state);
+                drop(state);
+                self.spawn_liveness_monitor(active_id);
+                Ok(snapshot)
             }
             Err(ConnectOutcome::TrustRequired { .. }) => {
                 let mut state = self.state.lock().await;
@@ -175,7 +197,7 @@ impl SessionManager {
         }
     }
 
-    pub async fn disconnect(&self) -> Result<RemoteConnectionSnapshot> {
+    pub async fn disconnect(self: &Arc<Self>) -> Result<RemoteConnectionSnapshot> {
         self.disconnect_internal().await;
         let mut state = self.state.lock().await;
         state.pending_trust = None;
@@ -183,7 +205,7 @@ impl SessionManager {
         Ok(snapshot_from_state(&state))
     }
 
-    pub async fn refresh_remote_directory(&self) -> Result<RemoteConnectionSnapshot> {
+    pub async fn refresh_remote_directory(self: &Arc<Self>) -> Result<RemoteConnectionSnapshot> {
         let mut state = self.state.lock().await;
         let Some(active) = state.active.as_mut() else {
             state.last_error = Some("Connect to a host before refreshing the remote pane.".into());
@@ -203,7 +225,7 @@ impl SessionManager {
         }
     }
 
-    pub async fn open_remote_directory(&self, path: String) -> Result<RemoteConnectionSnapshot> {
+    pub async fn open_remote_directory(self: &Arc<Self>, path: String) -> Result<RemoteConnectionSnapshot> {
         let mut state = self.state.lock().await;
         let Some(active) = state.active.as_mut() else {
             state.last_error = Some("Connect to a host before opening a remote directory.".into());
@@ -223,7 +245,7 @@ impl SessionManager {
         }
     }
 
-    pub async fn go_up_remote_directory(&self) -> Result<RemoteConnectionSnapshot> {
+    pub async fn go_up_remote_directory(self: &Arc<Self>) -> Result<RemoteConnectionSnapshot> {
         let mut state = self.state.lock().await;
         let Some(active) = state.active.as_mut() else {
             state.last_error = Some("Connect to a host before navigating the remote pane.".into());
@@ -245,6 +267,107 @@ impl SessionManager {
                 Ok(snapshot_from_state(&state))
             }
         }
+    }
+
+    pub async fn open_transfer_sftp(self: &Arc<Self>) -> Result<SftpSession> {
+        let mut state = self.state.lock().await;
+        let Some(active) = state.active.as_mut() else {
+            bail!("Connect to a host before starting a transfer.")
+        };
+
+        let channel = match active
+            .handle
+            .channel_open_session()
+            .await
+        {
+            Ok(channel) => channel,
+            Err(_) => {
+                let message = if active.handle.is_closed() {
+                    "The SSH session ended before the transfer could start. Reconnect and try again."
+                } else {
+                    "Connected to the server, but could not open an SSH session channel for transfer."
+                };
+                if active.handle.is_closed() {
+                    state.active = None;
+                    state.pending_trust = None;
+                    state.last_error = Some(message.into());
+                    let snapshot = snapshot_from_state(&state);
+                    drop(state);
+                    self.emit_snapshot(snapshot);
+                }
+                bail!(message)
+            }
+        };
+
+        if let Err(_) = channel
+            .request_subsystem(true, "sftp")
+            .await
+        {
+            bail!("Connected to the server, but SFTP is not available for transfers on this host.")
+        }
+
+        SftpSession::new(channel.into_stream())
+            .await
+            .map_err(|_| anyhow!("Connected to the server, but could not start an SFTP transfer channel."))
+    }
+
+    pub async fn handle_connection_loss(self: &Arc<Self>, message: String) -> RemoteConnectionSnapshot {
+        let snapshot = {
+            let mut state = self.state.lock().await;
+            if state.active.is_none() && state.last_error.as_deref() == Some(message.as_str()) {
+                return snapshot_from_state(&state);
+            }
+
+            state.active = None;
+            state.pending_trust = None;
+            state.last_error = Some(message);
+            snapshot_from_state(&state)
+        };
+        self.emit_snapshot(snapshot.clone());
+        snapshot
+    }
+
+    fn spawn_liveness_monitor(self: &Arc<Self>, session_id: u64) {
+        let manager = self.clone();
+        tokio::spawn(async move {
+            let mut interval = time::interval(Duration::from_secs(5));
+            interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+
+            loop {
+                interval.tick().await;
+
+                let snapshot = {
+                    let mut state = manager.state.lock().await;
+                    let Some(active) = state.active.as_ref() else {
+                        return;
+                    };
+
+                    if active.id != session_id {
+                        return;
+                    }
+
+                    if !active.handle.is_closed() {
+                        None
+                    } else {
+                        state.active = None;
+                        state.pending_trust = None;
+                        state.last_error = Some(
+                            "Connection lost after idle. Reconnect to continue browsing or transferring.".into(),
+                        );
+                        Some(snapshot_from_state(&state))
+                    }
+                };
+
+                if let Some(snapshot) = snapshot {
+                    manager.emit_snapshot(snapshot);
+                    return;
+                }
+            }
+        });
+    }
+
+    fn emit_snapshot(&self, snapshot: RemoteConnectionSnapshot) {
+        let _ = self.app_handle.emit(REMOTE_SESSION_UPDATED_EVENT, snapshot);
     }
 
     async fn disconnect_internal(&self) {
@@ -278,7 +401,9 @@ impl SessionManager {
         };
 
         let config = client::Config {
-            inactivity_timeout: Some(Duration::from_secs(30)),
+            inactivity_timeout: None,
+            keepalive_interval: Some(Duration::from_secs(45)),
+            keepalive_max: 3,
             ..Default::default()
         };
 
@@ -329,6 +454,7 @@ impl SessionManager {
         };
 
         Ok(ActiveRemoteSession {
+            id: self.next_session_id.fetch_add(1, Ordering::Relaxed),
             request,
             handle,
             sftp,

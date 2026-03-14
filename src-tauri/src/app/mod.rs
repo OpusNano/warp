@@ -2,20 +2,27 @@ use tauri::State;
 
 use crate::{
     local_fs::LocalFilesystem,
-    models::{AppBootstrap, ConnectRequest, PaneSet, PaneSnapshot, RemoteConnectionSnapshot, TrustDecision},
+    models::{
+        AppBootstrap, ConnectRequest, PaneSet, PaneSnapshot, QueueDownloadRequest,
+        QueueUploadRequest, RemoteConnectionSnapshot, TransferConflictResolution,
+        TransferQueueSnapshot, TrustDecision,
+    },
     session::SessionManager,
+    transfer::TransferManager,
 };
 
 #[tauri::command]
 pub async fn bootstrap_app_state(
     local_fs: State<'_, LocalFilesystem>,
-    session_manager: State<'_, SessionManager>,
+    session_manager: State<'_, std::sync::Arc<SessionManager>>,
+    transfer_manager: State<'_, std::sync::Arc<TransferManager>>,
 ) -> Result<AppBootstrap, String> {
     let local = local_fs
         .list_directory(None)
         .map_err(|error| error.to_string())?;
 
     let remote = session_manager.snapshot().await;
+    let transfers = transfer_manager.snapshot().await;
 
     Ok(AppBootstrap {
         connection_profiles: AppBootstrap::sample_profiles(),
@@ -24,7 +31,7 @@ pub async fn bootstrap_app_state(
             local,
             remote: remote.remote_pane,
         },
-        transfers: Vec::new(),
+        transfers,
         shortcuts: AppBootstrap::current_shortcuts(),
     })
 }
@@ -85,7 +92,7 @@ pub fn delete_local_entry(
 
 #[tauri::command]
 pub async fn connect_remote(
-    session_manager: State<'_, SessionManager>,
+    session_manager: State<'_, std::sync::Arc<SessionManager>>,
     request: ConnectRequest,
 ) -> Result<RemoteConnectionSnapshot, String> {
     session_manager
@@ -96,7 +103,7 @@ pub async fn connect_remote(
 
 #[tauri::command]
 pub async fn resolve_remote_trust(
-    session_manager: State<'_, SessionManager>,
+    session_manager: State<'_, std::sync::Arc<SessionManager>>,
     decision: TrustDecision,
 ) -> Result<RemoteConnectionSnapshot, String> {
     session_manager
@@ -107,7 +114,7 @@ pub async fn resolve_remote_trust(
 
 #[tauri::command]
 pub async fn disconnect_remote(
-    session_manager: State<'_, SessionManager>,
+    session_manager: State<'_, std::sync::Arc<SessionManager>>,
 ) -> Result<RemoteConnectionSnapshot, String> {
     session_manager
         .disconnect()
@@ -117,7 +124,7 @@ pub async fn disconnect_remote(
 
 #[tauri::command]
 pub async fn refresh_remote_directory(
-    session_manager: State<'_, SessionManager>,
+    session_manager: State<'_, std::sync::Arc<SessionManager>>,
 ) -> Result<RemoteConnectionSnapshot, String> {
     session_manager
         .refresh_remote_directory()
@@ -127,7 +134,7 @@ pub async fn refresh_remote_directory(
 
 #[tauri::command]
 pub async fn open_remote_directory(
-    session_manager: State<'_, SessionManager>,
+    session_manager: State<'_, std::sync::Arc<SessionManager>>,
     path: String,
 ) -> Result<RemoteConnectionSnapshot, String> {
     session_manager
@@ -138,10 +145,66 @@ pub async fn open_remote_directory(
 
 #[tauri::command]
 pub async fn go_up_remote_directory(
-    session_manager: State<'_, SessionManager>,
+    session_manager: State<'_, std::sync::Arc<SessionManager>>,
 ) -> Result<RemoteConnectionSnapshot, String> {
     session_manager
         .go_up_remote_directory()
         .await
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn queue_download(
+    transfer_manager: State<'_, std::sync::Arc<TransferManager>>,
+    request: QueueDownloadRequest,
+) -> Result<TransferQueueSnapshot, String> {
+    transfer_manager
+        .queue_download(request)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn queue_upload(
+    transfer_manager: State<'_, std::sync::Arc<TransferManager>>,
+    request: QueueUploadRequest,
+) -> Result<TransferQueueSnapshot, String> {
+    transfer_manager
+        .queue_upload(request)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn list_transfer_jobs(
+    transfer_manager: State<'_, std::sync::Arc<TransferManager>>,
+) -> Result<TransferQueueSnapshot, String> {
+    Ok(transfer_manager.snapshot().await)
+}
+
+#[tauri::command]
+pub async fn cancel_transfer(
+    transfer_manager: State<'_, std::sync::Arc<TransferManager>>,
+    job_id: String,
+) -> Result<TransferQueueSnapshot, String> {
+    Ok(transfer_manager.cancel_transfer(&job_id).await)
+}
+
+#[tauri::command]
+pub async fn resolve_transfer_conflict(
+    transfer_manager: State<'_, std::sync::Arc<TransferManager>>,
+    job_id: String,
+    resolution: TransferConflictResolution,
+) -> Result<TransferQueueSnapshot, String> {
+    transfer_manager
+        .resolve_conflict(&job_id, resolution)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn clear_completed_transfers(
+    transfer_manager: State<'_, std::sync::Arc<TransferManager>>,
+) -> Result<TransferQueueSnapshot, String> {
+    Ok(transfer_manager.clear_completed().await)
 }

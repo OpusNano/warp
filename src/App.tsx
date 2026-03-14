@@ -1,17 +1,23 @@
 import { For, Show, createMemo, createSignal, onCleanup, onMount } from 'solid-js'
+import { listen } from '@tauri-apps/api/event'
 import {
   bootstrapAppState,
+  cancelTransfer,
+  clearCompletedTransfers,
   connectRemote,
   deleteLocalEntry,
   disconnectRemote,
   goUpLocalDirectory,
   goUpRemoteDirectory,
+  queueDownload,
+  queueUpload,
   listLocalDirectory,
   openLocalDirectory,
   openRemoteDirectory,
   refreshRemoteDirectory,
   renameLocalEntry,
   resolveRemoteTrust,
+  resolveTransferConflict,
 } from './lib/tauri'
 import type {
   AppBootstrap,
@@ -19,6 +25,7 @@ import type {
   FileEntry,
   PaneId,
   PaneSnapshot,
+  TransferQueueSnapshot,
   RemoteConnectionSnapshot,
   TransferJob,
   TrustPrompt,
@@ -55,7 +62,12 @@ const defaultState: AppBootstrap = {
       emptyMessage: 'Connect to a host to browse remote files.',
     },
   },
-  transfers: [],
+  transfers: {
+    jobs: [],
+    activeJobId: null,
+    queuedCount: 0,
+    finishedCount: 0,
+  },
   shortcuts: [],
 }
 
@@ -99,15 +111,36 @@ function entryTone(kind: FileEntry['kind']) {
 
 function transferTone(state: TransferJob['state']) {
   switch (state) {
+    case 'Checking':
     case 'Running':
+    case 'Cancelling':
       return 'text-white'
-    case 'Complete':
+    case 'Succeeded':
       return 'text-emerald-300'
     case 'Failed':
       return 'text-red-300'
+    case 'AwaitingConflictDecision':
+      return 'text-amber-200'
     default:
       return 'text-zinc-400'
   }
+}
+
+function transferStateLabel(state: TransferJob['state']) {
+  switch (state) {
+    case 'AwaitingConflictDecision':
+      return 'Conflict'
+    default:
+      return state
+  }
+}
+
+function parentDirectory(path: string) {
+  if (!path || path === '/' || path === 'Not connected') return path
+  const normalized = path.endsWith('/') && path !== '/' ? path.slice(0, -1) : path
+  const index = normalized.lastIndexOf('/')
+  if (index <= 0) return normalized.startsWith('/') ? '/' : '.'
+  return normalized.slice(0, index)
 }
 
 function isEditableTarget(target: EventTarget | null) {
@@ -147,7 +180,7 @@ function App() {
   const [session, setSession] = createSignal(defaultState.session)
   const [localPane, setLocalPane] = createSignal(defaultState.panes.local)
   const [remotePane, setRemotePane] = createSignal(defaultState.panes.remote)
-  const [transfers, setTransfers] = createSignal(defaultState.transfers)
+  const [transfers, setTransfers] = createSignal<TransferQueueSnapshot>(defaultState.transfers)
   const [shortcuts, setShortcuts] = createSignal(defaultState.shortcuts)
   const [activePane, setActivePane] = createSignal<PaneId>('local')
   const [dividerRatio, setDividerRatio] = createSignal(0.5)
@@ -185,6 +218,40 @@ function App() {
     return localPane().entries.find((entry) => entry.name === selection) ?? null
   })
 
+  const remoteSelectedEntry = createMemo(() => {
+    const selection = remoteSelection()
+    if (!selection) return null
+    return remotePane().entries.find((entry) => entry.name === selection) ?? null
+  })
+
+  const applyTransferSnapshot = (snapshot: TransferQueueSnapshot) => {
+    const previousJobs = new Map(transfers().jobs.map((job) => [job.id, job.state]))
+    setTransfers(snapshot)
+
+    for (const job of snapshot.jobs) {
+      if (job.state !== 'Succeeded' || previousJobs.get(job.id) === 'Succeeded') {
+        continue
+      }
+
+      if (job.direction === 'Download' && parentDirectory(job.destinationPath) === localPane().location) {
+        void refreshPane('local')
+      }
+
+      if (job.direction === 'Upload' && parentDirectory(job.destinationPath) === remotePane().location) {
+        void refreshPane('remote')
+      }
+    }
+  }
+
+  const handleRemoteSessionUpdate = (snapshot: RemoteConnectionSnapshot) => {
+    setRemoteLoading(false)
+    applyRemoteSnapshot(snapshot, remoteSelection())
+    if (snapshot.session.connectionState === 'Disconnected') {
+      setTrustPrompt(null)
+      setRemoteSelection(null)
+    }
+  }
+
   const clearRemoteTransientState = (emptyMessage: string) => {
     setRemotePane(remotePlaceholder(emptyMessage))
     setRemoteSelection(null)
@@ -208,12 +275,25 @@ function App() {
   }
 
   onMount(async () => {
+    if (window.__TAURI_INTERNALS__) {
+      const unlistenTransfers = await listen<TransferQueueSnapshot>('transfer-queue-updated', (event) => {
+        applyTransferSnapshot(event.payload)
+      })
+      const unlistenSession = await listen<RemoteConnectionSnapshot>('remote-session-updated', (event) => {
+        handleRemoteSessionUpdate(event.payload)
+      })
+      onCleanup(() => {
+        void unlistenTransfers()
+        void unlistenSession()
+      })
+    }
+
     const state = await bootstrapAppState()
 
     setSession(state.session)
     setLocalPane(state.panes.local)
     setRemotePane(state.panes.remote)
-    setTransfers(state.transfers)
+    applyTransferSnapshot(state.transfers)
     setShortcuts(state.shortcuts)
     syncSelection('local', state.panes.local, null)
     syncSelection('remote', state.panes.remote, null)
@@ -364,6 +444,7 @@ function App() {
 
   const localEntries = createMemo(() => filteredEntries(localPane(), localFilter()))
   const remoteEntries = createMemo(() => filteredEntries(remotePane(), remoteFilter()))
+  const orderedTransferJobs = createMemo(() => [...transfers().jobs].reverse())
 
   const paneClass = (paneId: PaneId) =>
     activePane() === paneId
@@ -637,6 +718,82 @@ function App() {
       setLocalError(error instanceof Error ? error.message : 'Failed to delete entry.')
     } finally {
       setLocalLoading(false)
+    }
+  }
+
+  const uploadCandidate = createMemo(() => {
+    const entry = localSelectedEntry()
+    if (!entry || entry.kind !== 'file') return null
+    if (session().connectionState !== 'Connected' || remotePane().location === 'Not connected') return null
+    return entry
+  })
+
+  const downloadCandidate = createMemo(() => {
+    const entry = remoteSelectedEntry()
+    if (!entry || entry.kind !== 'file') return null
+    if (session().connectionState !== 'Connected') return null
+    return entry
+  })
+
+  const queueSelectedUpload = async () => {
+    const entry = uploadCandidate()
+    if (!entry) return
+
+    try {
+      const snapshot = await queueUpload({
+        localPath: entry.path,
+        localName: entry.name,
+        remoteDirectory: remotePane().location,
+      })
+      applyTransferSnapshot(snapshot)
+    } catch (error) {
+      setLocalError(error instanceof Error ? error.message : 'Failed to queue upload.')
+    }
+  }
+
+  const queueSelectedDownload = async () => {
+    const entry = downloadCandidate()
+    if (!entry) return
+
+    try {
+      const snapshot = await queueDownload({
+        remotePath: entry.path,
+        remoteName: entry.name,
+        localDirectory: localPane().location,
+      })
+      applyTransferSnapshot(snapshot)
+    } catch (error) {
+      setRemoteRuntimeError(error instanceof Error ? error.message : 'Failed to queue download.')
+    }
+  }
+
+  const cancelTransferJob = async (jobId: string) => {
+    try {
+      const snapshot = await cancelTransfer(jobId)
+      applyTransferSnapshot(snapshot)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to cancel transfer.'
+      setRemoteRuntimeError(message)
+    }
+  }
+
+  const resolveTransferJobConflict = async (jobId: string, action: 'overwrite' | 'cancel') => {
+    try {
+      const snapshot = await resolveTransferConflict(jobId, { action })
+      applyTransferSnapshot(snapshot)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to resolve transfer conflict.'
+      setRemoteRuntimeError(message)
+    }
+  }
+
+  const clearTransferHistory = async () => {
+    try {
+      const snapshot = await clearCompletedTransfers()
+      applyTransferSnapshot(snapshot)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to clear transfer history.'
+      setRemoteRuntimeError(message)
     }
   }
 
@@ -916,6 +1073,9 @@ function App() {
                   onRenameCancel={cancelInlineRename}
                   onUp={() => void goUpInPane('local')}
                   onRefresh={() => void refreshPane('local')}
+                  transferActionLabel="Upload"
+                  onTransfer={() => void queueSelectedUpload()}
+                  transferDisabled={!uploadCandidate() || localLoading() || remoteLoading()}
                   onDelete={() => openDeleteConfirmation()}
                 />
               </div>
@@ -962,45 +1122,88 @@ function App() {
                   onEntryOpen={(entry) => void openEntry('remote', entry)}
                   onUp={() => void goUpInPane('remote')}
                   onRefresh={() => void refreshPane('remote')}
+                  transferActionLabel="Download"
+                  onTransfer={() => void queueSelectedDownload()}
+                  transferDisabled={!downloadCandidate() || remoteLoading() || localLoading()}
                   onDelete={undefined}
                 />
               </div>
             </div>
           </section>
 
-          <section class="shrink-0 border-t border-white/10 bg-black/50 px-4 pb-4 pt-3 sm:px-6">
-            <div class="mb-3 flex items-center justify-between">
-              <div>
-                <div class="font-mono text-[11px] uppercase tracking-[0.24em] text-zinc-500">Transfer Queue</div>
+          <section class="shrink-0 border-t border-white/10 bg-black/50 px-4 pb-3 pt-2 sm:px-6">
+            <div class="mb-2 flex items-center justify-between gap-3">
+              <div class="font-mono text-[11px] uppercase tracking-[0.24em] text-zinc-500">Transfer Queue</div>
+              <div class="flex items-center gap-3 font-mono text-xs text-zinc-500">
+                <div>{transfers().jobs.length} jobs</div>
+                <button
+                  class="warp-button px-2 py-1 text-[11px]"
+                  disabled={!transfers().jobs.some((job) => ['Succeeded', 'Failed', 'Cancelled'].includes(job.state))}
+                  onClick={() => void clearTransferHistory()}
+                >
+                  Clear
+                </button>
               </div>
-              <div class="font-mono text-xs text-zinc-500">{transfers().length} jobs</div>
             </div>
 
             <Show
-              when={transfers().length > 0}
+              when={transfers().jobs.length > 0}
               fallback={
-                <div class="flex min-h-28 items-center justify-center rounded-lg border border-dashed border-white/10 bg-black/40 px-6 text-center font-mono text-sm text-zinc-500">
+                <div class="flex h-20 items-center justify-center rounded-lg border border-dashed border-white/10 bg-black/40 px-6 text-center font-mono text-sm text-zinc-500">
                   No transfer activity yet.
                 </div>
               }
             >
-              <div class="grid gap-px overflow-hidden rounded-lg border border-white/10 bg-white/10">
-                <For each={transfers()}>
+              <div class="max-h-52 overflow-y-auto rounded-lg border border-white/10 bg-black/70">
+                <For each={orderedTransferJobs()}>
                   {(job) => (
-                    <div class="grid gap-3 bg-black px-4 py-3 lg:grid-cols-[1.2fr_2fr_110px_100px_90px] lg:items-center">
-                      <div>
-                        <div class="font-mono text-xs uppercase tracking-[0.2em] text-zinc-500">{job.direction}</div>
-                        <div class={`mt-1 font-mono text-sm ${transferTone(job.state)}`}>{job.protocol}</div>
+                    <div class="border-b border-white/5 px-3 py-2 last:border-b-0">
+                      <div class="flex items-center gap-3 text-left">
+                        <div class={`font-mono text-sm ${job.direction === 'Upload' ? 'text-zinc-400' : 'text-zinc-300'}`}>
+                          {job.direction === 'Upload' ? '↑' : '↓'}
+                        </div>
+                        <div class="min-w-0 flex-1">
+                          <div class="flex items-center gap-3 font-mono text-sm">
+                            <div class="truncate text-white">{job.name}</div>
+                            <Show when={!job.conflict && job.state !== 'Failed'}>
+                              <div class="shrink-0 text-zinc-500">
+                                {job.progressPercent === null ? '--' : `${job.progressPercent}%`}
+                                <span class="mx-2 text-zinc-700">/</span>
+                                {job.rate ?? transferStateLabel(job.state)}
+                              </div>
+                            </Show>
+                          </div>
+                          <Show when={job.conflict}>
+                            {(conflict) => (
+                              <div class="mt-1 flex flex-wrap items-center gap-2 font-mono text-xs text-amber-100">
+                                <span>
+                                  Conflict: destination exists as {conflict().destinationKind === 'dir' ? 'a directory' : 'a file'}.
+                                </span>
+                                <Show when={conflict().canOverwrite}>
+                                  <button class="warp-button px-2 py-1 text-[11px]" onClick={() => void resolveTransferJobConflict(job.id, 'overwrite')}>
+                                    Overwrite
+                                  </button>
+                                </Show>
+                                <button class="warp-button px-2 py-1 text-[11px]" onClick={() => void resolveTransferJobConflict(job.id, 'cancel')}>
+                                  Cancel
+                                </button>
+                              </div>
+                            )}
+                          </Show>
+                          <Show when={!job.conflict && job.state === 'Failed' && job.errorMessage}>
+                            {(message) => <div class="mt-1 truncate font-mono text-xs text-red-200">{message()}</div>}
+                          </Show>
+                          <Show when={!job.conflict && job.state !== 'Failed'}>
+                            <div class="mt-1 truncate font-mono text-[11px] text-zinc-600" title={`${job.sourcePath} -> ${job.destinationPath}`}>
+                              {job.destinationPath}
+                            </div>
+                          </Show>
+                        </div>
+                        <div class={`shrink-0 font-mono text-xs ${transferTone(job.state)}`}>{transferStateLabel(job.state)}</div>
+                        <button class="warp-button shrink-0 px-2 py-1 text-[11px]" disabled={!job.canCancel} onClick={() => void cancelTransferJob(job.id)}>
+                          Cancel
+                        </button>
                       </div>
-                      <div class="min-w-0">
-                        <div class="truncate font-mono text-sm text-white">{job.name}</div>
-                        <div class="truncate font-mono text-xs text-zinc-500">{job.path}</div>
-                      </div>
-                      <div class="font-mono text-sm text-zinc-300">{job.rate ?? '--'}</div>
-                      <div class="font-mono text-sm text-zinc-300">
-                        {job.progressPercent === null ? '--' : `${job.progressPercent}%`}
-                      </div>
-                      <div class={`font-mono text-sm ${transferTone(job.state)}`}>{job.state}</div>
                     </div>
                   )}
                 </For>
@@ -1069,6 +1272,9 @@ type PaneProps = {
   onRenameCancel?: () => void
   onUp?: () => void
   onRefresh?: () => void
+  transferActionLabel?: string
+  onTransfer?: () => void
+  transferDisabled?: boolean
   onDelete?: () => void
 }
 
@@ -1124,6 +1330,9 @@ function Pane(props: PaneProps) {
           </button>
           <button class="warp-button" disabled={!props.onRefresh || props.loading} onClick={props.onRefresh}>
             Refresh
+          </button>
+          <button class="warp-button" disabled={!props.onTransfer || props.transferDisabled} onClick={props.onTransfer}>
+            {props.transferActionLabel ?? 'Transfer'}
           </button>
           <button
             class="warp-button"

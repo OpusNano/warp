@@ -24,10 +24,29 @@ export type TransferJob = {
   protocol: 'SFTP' | 'SCP compatibility'
   direction: 'Upload' | 'Download'
   name: string
-  path: string
+  sourcePath: string
+  destinationPath: string
   rate: string | null
+  bytesTotal: number | null
+  bytesTransferred: number
   progressPercent: number | null
-  state: 'Queued' | 'Running' | 'Complete' | 'Failed'
+  state: 'Queued' | 'Checking' | 'AwaitingConflictDecision' | 'Running' | 'Cancelling' | 'Cancelled' | 'Succeeded' | 'Failed'
+  errorMessage: string | null
+  conflict: TransferConflict | null
+  canCancel: boolean
+}
+
+export type TransferConflict = {
+  destinationExists: boolean
+  destinationKind: 'file' | 'dir' | 'symlink' | 'unknown'
+  canOverwrite: boolean
+}
+
+export type TransferQueueSnapshot = {
+  jobs: TransferJob[]
+  activeJobId: string | null
+  queuedCount: number
+  finishedCount: number
 }
 
 export type SessionSnapshot = {
@@ -77,6 +96,22 @@ export type TrustDecision = {
   trust: boolean
 }
 
+export type QueueDownloadRequest = {
+  remotePath: string
+  remoteName: string
+  localDirectory: string
+}
+
+export type QueueUploadRequest = {
+  localPath: string
+  localName: string
+  remoteDirectory: string
+}
+
+export type TransferConflictResolution = {
+  action: 'overwrite' | 'cancel'
+}
+
 export type AppBootstrap = {
   connectionProfiles: ConnectionProfile[]
   session: SessionSnapshot
@@ -84,6 +119,6 @@ export type AppBootstrap = {
     local: PaneSnapshot
     remote: PaneSnapshot
   }
-  transfers: TransferJob[]
+  transfers: TransferQueueSnapshot
   shortcuts: string[]
 }
